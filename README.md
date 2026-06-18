@@ -40,6 +40,7 @@ Modes:
 
 Options:
   --dump-ptx          开启 PTX dump
+  --dump-sass         额外 dump SASS（GPU 机器码），与 PTX 并行输出
   --nccl-only         (dual only) 只保留 NCCL 相关 kernel
   --trace-calls       记录 torch → ATen → CUDA 调用链
   --model-path PATH   模型路径 (默认 /home/model/Qwen3-8B)
@@ -133,7 +134,19 @@ run.py                   # CLI 入口 (统一参数解析 + 调度)
 
 本项目使用本地编译的 NCCL 2.21.5 (`/home/zhangchen/PTX/nccl/`)。
 
-如需重新编译 (带 PTX):
+### PTX 与 SASS 的区别
+
+| | PTX | SASS |
+|--|-----|------|
+| 本质 | 虚拟 GPU 汇编（中间表示） | 实际 GPU 机器码 |
+| 可读性 | 高（虚拟寄存器、文本指令） | 低（二进制编码、固定寄存器） |
+| 编译选项 | `code=compute_80` | `code=sm_80` |
+| 默认包含 | ❌ NCCL 默认不嵌入 | ✅ 始终包含 |
+
+`--dump-ptx` 优先提取 PTX。如果 NCCL 没有嵌入 PTX（默认情况），系统会提示你重新编译。
+如需同时输出 SASS，加 `--dump-sass`。
+
+### 重新编译 NCCL（嵌入 PTX）
 ```bash
 cd ~/PTX/nccl
 make -j src.build NVCC_GENCODE="-gencode=arch=compute_80,code=compute_80"

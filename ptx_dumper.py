@@ -333,21 +333,25 @@ class PTXDumper:
 # ─── High-level functions ─────────────────────────────────────────────
 
 
-def dump_single_gpu_ptx(config: EnvConfig, trace_calls: bool = False) -> list:
+def dump_single_gpu_ptx(config: EnvConfig, trace_calls: bool = False,
+                        dump_sass: bool = False) -> list:
     """
-    Dump all PTX/SASS for single-GPU mode.
+    Dump PTX for single-GPU mode.
 
-    Captures: JIT PTX → NCCL lib PTX → NCCL SASS (fallback).
+    提取策略（按优先级）:
+      1. JIT PTX → 2. NCCL lib PTX → 3. 已有 PTX 文件 → 4. SASS（仅当无 PTX 时兜底）
+
+    当 dump_sass=True 时，无论 PTX 是否存在都会额外提取 SASS。
     """
     dumper = PTXDumper(config)
-    found = False
+    has_ptx = False
 
     # 1. JIT cache
     jit_dir = os.path.join(config.project_dir, ".jit_cache")
     jit_ptx = dumper.dump_ptx_from_jit_cache(jit_dir)
     if jit_ptx:
         print(f"  [OK] JIT PTX extracted ({len(jit_ptx)} chars)")
-        found = True
+        has_ptx = True
     else:
         print(f"  [INFO] No JIT PTX (kernels are pre-compiled)")
 
@@ -355,21 +359,29 @@ def dump_single_gpu_ptx(config: EnvConfig, trace_calls: bool = False) -> list:
     nccl_ptx = dumper.dump_nccl_ptx()
     if nccl_ptx:
         print(f"  [OK] NCCL PTX extracted ({len(nccl_ptx)} chars)")
-        found = True
+        has_ptx = True
 
     # 3. Existing PTX dump
-    if not found:
+    if not has_ptx:
         existing = dumper.dump_existing_nccl_ptx()
         if existing:
-            found = True
+            has_ptx = True
 
-    # 4. SASS fallback (always available)
-    print(f"  [INFO] Extracting SASS from NCCL lib (sm_80)...")
-    sass = dumper.dump_nccl_sass()
-    if sass:
-        print(f"  [OK] NCCL SASS extracted ({len(sass)} chars, "
-              f"{sass.count('Function')} functions)")
-        found = True
+    # 4. SASS — 仅在无 PTX 或用户明确要求时提取
+    if not has_ptx:
+        print(f"  [WARN] 未找到任何 PTX 来源，回退到 SASS 提取...")
+        print(f"  [TIP]  重新编译 NCCL 以嵌入 PTX:")
+        print(f"         cd ~/PTX/nccl && make -j src.build NVCC_GENCODE=\"-gencode=arch=compute_80,code=compute_80\"")
+        sass = dumper.dump_nccl_sass()
+        if sass:
+            print(f"  [OK] NCCL SASS extracted ({len(sass)} chars, "
+                  f"{sass.count('Function')} functions)")
+    elif dump_sass:
+        print(f"  [INFO] Extracting SASS (--dump-sass)...")
+        sass = dumper.dump_nccl_sass()
+        if sass:
+            print(f"  [OK] NCCL SASS extracted ({len(sass)} chars, "
+                  f"{sass.count('Function')} functions)")
 
     # Write output
     files = dumper.write_output(config.single_ptx_dir, nccl_only=False, prefix="single")
@@ -378,41 +390,53 @@ def dump_single_gpu_ptx(config: EnvConfig, trace_calls: bool = False) -> list:
 
 
 def dump_dual_gpu_ptx(config: EnvConfig, nccl_only: bool = False,
-                      trace_calls: bool = False) -> list:
+                      trace_calls: bool = False,
+                      dump_sass: bool = False) -> list:
     """
-    Dump PTX/SASS for dual-GPU mode (NCCL-focused).
+    Dump PTX for dual-GPU mode (NCCL-focused).
 
-    Captures: JIT PTX → NCCL lib PTX → existing PTX → SASS.
+    提取策略（按优先级）:
+      1. JIT PTX → 2. NCCL lib PTX → 3. 已有 PTX 文件 → 4. SASS（仅当无 PTX 时兜底）
+
+    当 dump_sass=True 时，无论 PTX 是否存在都会额外提取 SASS。
     """
     dumper = PTXDumper(config)
-    found = False
+    has_ptx = False
 
     # 1. JIT cache
     jit_dir = os.path.join(config.project_dir, ".jit_cache")
     jit_ptx = dumper.dump_ptx_from_jit_cache(jit_dir)
     if jit_ptx:
         print(f"  [OK] JIT PTX extracted ({len(jit_ptx)} chars)")
-        found = True
+        has_ptx = True
 
     # 2. NCCL lib PTX
     nccl_ptx = dumper.dump_nccl_ptx()
     if nccl_ptx:
         print(f"  [OK] NCCL PTX from lib ({len(nccl_ptx)} chars)")
-        found = True
+        has_ptx = True
 
     # 3. Existing PTX dump
-    if not found:
+    if not has_ptx:
         existing = dumper.dump_existing_nccl_ptx()
         if existing:
-            found = True
+            has_ptx = True
 
-    # 4. SASS fallback
-    print(f"  [INFO] Extracting SASS from NCCL lib (sm_80)...")
-    sass = dumper.dump_nccl_sass()
-    if sass:
-        n_funcs = sass.count("Function")
-        print(f"  [OK] NCCL SASS extracted ({len(sass)} chars, {n_funcs} functions)")
-        found = True
+    # 4. SASS — 仅在无 PTX 或用户明确要求时提取
+    if not has_ptx:
+        print(f"  [WARN] 未找到任何 PTX 来源，回退到 SASS 提取...")
+        print(f"  [TIP]  重新编译 NCCL 以嵌入 PTX:")
+        print(f"         cd ~/PTX/nccl && make -j src.build NVCC_GENCODE=\"-gencode=arch=compute_80,code=compute_80\"")
+        sass = dumper.dump_nccl_sass()
+        if sass:
+            n_funcs = sass.count("Function")
+            print(f"  [OK] NCCL SASS extracted ({len(sass)} chars, {n_funcs} functions)")
+    elif dump_sass:
+        print(f"  [INFO] Extracting SASS (--dump-sass)...")
+        sass = dumper.dump_nccl_sass()
+        if sass:
+            n_funcs = sass.count("Function")
+            print(f"  [OK] NCCL SASS extracted ({len(sass)} chars, {n_funcs} functions)")
 
     # Write output
     files = dumper.write_output(config.nccl_ptx_dir, nccl_only=nccl_only, prefix="nccl")

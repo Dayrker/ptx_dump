@@ -47,6 +47,8 @@ Examples:
                        help="Max tokens to generate")
         p.add_argument("--dump-ptx", action="store_true",
                        help="Dump PTX to output directory")
+        p.add_argument("--dump-sass", action="store_true",
+                       help="Also dump SASS (GPU machine code) alongside PTX")
         p.add_argument("--trace-calls", action="store_true",
                        help="Record torch → ATen → CUDA call chains")
         p.add_argument("--output-dir", default=None,
@@ -87,6 +89,8 @@ Examples:
         ]
         if args.dump_ptx:
             cmd.append("--dump-ptx")
+        if args.dump_sass:
+            cmd.append("--dump-sass")
         if args.trace_calls:
             cmd.append("--trace-calls")
         if args.output_dir:
@@ -104,6 +108,8 @@ Examples:
         ]
         if args.dump_ptx:
             cmd.append("--dump-ptx")
+        if args.dump_sass:
+            cmd.append("--dump-sass")
         if args.nccl_only:
             cmd.append("--nccl-only")
         if args.trace_calls:

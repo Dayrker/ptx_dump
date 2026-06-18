@@ -20,6 +20,8 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--dump-ptx", action="store_true",
                    help="Dump all CUDA PTX to single_ptx/")
+    p.add_argument("--dump-sass", action="store_true",
+                   help="Also dump SASS (GPU machine code) alongside PTX")
     p.add_argument("--trace-calls", action="store_true",
                    help="Record call chains (torch → ATen → CUDA)")
     p.add_argument("--output-dir", default=None,
@@ -122,7 +124,8 @@ def run_single_gpu(args):
     # ─── PTX dump ───
     if args.dump_ptx:
         print(f"\n[4/4] Dumping PTX to {output_dir}/")
-        files = dump_single_gpu_ptx(config, trace_calls=args.trace_calls)
+        files = dump_single_gpu_ptx(config, trace_calls=args.trace_calls,
+                                     dump_sass=args.dump_sass)
         print(f"      Written {len(files)} files.")
     else:
         print(f"\n[4/4] Skipping PTX dump (use --dump-ptx to enable)")
