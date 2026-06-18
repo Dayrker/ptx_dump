@@ -298,8 +298,14 @@ class PTXDumper:
     # ── Output ──
 
     def write_output(self, output_dir: str, nccl_only: bool = False,
-                     prefix: str = "dump", arch: str = "sm_80") -> list:
-        """Write all collected PTX/SASS to formatted output files."""
+                     prefix: str = "dump", arch: str = "sm_80",
+                     used_kernels: set = None) -> list:
+        """Write all collected PTX/SASS to formatted output files.
+
+        Args:
+            used_kernels: If provided, only write kernels whose demangled name
+                          appears in this set. None = write all.
+        """
         os.makedirs(output_dir, exist_ok=True)
         written = []
 
@@ -308,33 +314,114 @@ class PTXDumper:
         if all_ptx.strip():
             if nccl_only:
                 all_ptx = self.filter_nccl_ptx(all_ptx)
+            if used_kernels:
+                all_ptx, kept, total = self._filter_used_ptx(all_ptx, used_kernels)
+                print(f"  [INFO] used-only 过滤: 保留 {kept}/{total} 个 kernel")
             if all_ptx.strip():
                 files = write_formatted_ptx(all_ptx, output_dir, prefix=prefix,
                                            split_per_kernel=True)
                 written.extend(files)
                 print(f"  [OK] PTX written ({len(files)} files)")
 
-        # 2. Write SASS if available (always the fallback)
+        # 2. Write SASS if available
         all_sass = "\n\n".join(self.collected_sass.values())
         if all_sass.strip():
-            sass_files = write_formatted_sass(
-                all_sass, output_dir, prefix=prefix,
-                arch=arch, nccl_only=nccl_only,
-            )
-            written.extend(sass_files)
-            print(f"  [OK] SASS written ({len(sass_files)} files)")
+            if used_kernels:
+                all_sass, kept, total = self._filter_used_sass(all_sass, used_kernels)
+                print(f"  [INFO] used-only 过滤: 保留 {kept}/{total} 个 SASS kernel")
+            if all_sass.strip():
+                sass_files = write_formatted_sass(
+                    all_sass, output_dir, prefix=prefix,
+                    arch=arch, nccl_only=nccl_only,
+                )
+                written.extend(sass_files)
+                print(f"  [OK] SASS written ({len(sass_files)} files)")
 
         if not written:
             print(f"  [WARN] No PTX or SASS collected.")
 
         return written
 
+    def _filter_used_ptx(self, ptx_text: str, used_kernels: set) -> tuple:
+        """Filter PTX to only kernels whose demangled name is in used_kernels.
+
+        Returns: (filtered_text, kept_count, total_count)
+        """
+        from ptx_formatter import _split_ptx_into_kernels
+
+        kernel_blocks = _split_ptx_into_kernels(ptx_text)
+        if not kernel_blocks:
+            return ptx_text, 0, 0
+
+        # Extract header (text before first kernel)
+        header_lines = []
+        for line in ptx_text.split("\n"):
+            if re.match(r"(\.visible\s+)?\.entry\s+", line):
+                break
+            header_lines.append(line)
+        header = "\n".join(header_lines)
+
+        kept = []
+        total = len(kernel_blocks)
+        for block in kernel_blocks:
+            # Extract kernel name from block
+            m = re.match(r"(\.visible\s+)?\.entry\s+(\S+)", block.strip())
+            if not m:
+                continue
+            mangled = m.group(2).rstrip("(")
+            demangled = demangle_symbol(mangled)
+            # Match: demangled name starts with a kernel name in used_kernels
+            # or used_kernels contains a substring of demangled
+            if _kernel_name_matches(demangled, mangled, used_kernels):
+                kept.append(block)
+
+        if kept:
+            return header + "\n\n" + "\n\n".join(kept), len(kept), total
+        return "", 0, total
+
+    def _filter_used_sass(self, sass_text: str, used_kernels: set) -> tuple:
+        """Filter SASS to only kernels whose demangled name is in used_kernels.
+
+        Returns: (filtered_text, kept_count, total_count)
+        """
+        kernels = _parse_sass_into_kernels(sass_text)
+        total = len(kernels)
+        kept = [k for k in kernels
+                if _kernel_name_matches(k["demangled"], k["name"], used_kernels)]
+        text = "\n\n".join(_format_sass_kernel(k) for k in kept) if kept else ""
+        return text, len(kept), total
+
+
+def _kernel_name_matches(demangled: str, mangled: str, used_kernels: set) -> bool:
+    """Check if a kernel matches any name in the used_kernels set.
+
+    Handles both exact demangled match and substring matching
+    (profiler names may be truncated or formatted differently).
+    """
+    # Exact match on demangled name
+    if demangled in used_kernels:
+        return True
+
+    # Match by function name prefix (before first parenthesis)
+    func_name = demangled.split("(")[0].strip() if demangled else ""
+    for uk in used_kernels:
+        uk_func = uk.split("(")[0].strip() if uk else ""
+        if func_name and uk_func and func_name == uk_func:
+            return True
+
+    # Mangled name fallback (profiler sometimes shows mangled names)
+    if mangled in used_kernels:
+        return True
+
+    return False
+
 
 # ─── High-level functions ─────────────────────────────────────────────
 
 
 def dump_single_gpu_ptx(config: EnvConfig, trace_calls: bool = False,
-                        dump_sass: bool = False) -> list:
+                        dump_sass: bool = False,
+                        used_kernels: set = None) -> list:
     """
     Dump PTX for single-GPU mode.
 
@@ -384,14 +471,16 @@ def dump_single_gpu_ptx(config: EnvConfig, trace_calls: bool = False,
                   f"{sass.count('Function')} functions)")
 
     # Write output
-    files = dumper.write_output(config.single_ptx_dir, nccl_only=False, prefix="single")
+    files = dumper.write_output(config.single_ptx_dir, nccl_only=False,
+                                prefix="single", used_kernels=used_kernels)
     print(f"  [OK] Wrote {len(files)} files to {config.single_ptx_dir}")
     return files
 
 
 def dump_dual_gpu_ptx(config: EnvConfig, nccl_only: bool = False,
                       trace_calls: bool = False,
-                      dump_sass: bool = False) -> list:
+                      dump_sass: bool = False,
+                      used_kernels: set = None) -> list:
     """
     Dump PTX for dual-GPU mode (NCCL-focused).
 
@@ -439,6 +528,7 @@ def dump_dual_gpu_ptx(config: EnvConfig, nccl_only: bool = False,
             print(f"  [OK] NCCL SASS extracted ({len(sass)} chars, {n_funcs} functions)")
 
     # Write output
-    files = dumper.write_output(config.nccl_ptx_dir, nccl_only=nccl_only, prefix="nccl")
+    files = dumper.write_output(config.nccl_ptx_dir, nccl_only=nccl_only,
+                                prefix="nccl", used_kernels=used_kernels)
     print(f"  [OK] Wrote {len(files)} files to {config.nccl_ptx_dir}")
     return files

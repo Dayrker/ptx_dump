@@ -24,6 +24,8 @@ def parse_args():
                    help="Dump all CUDA PTX to single_ptx/")
     p.add_argument("--dump-sass", action="store_true",
                    help="Also dump SASS (GPU machine code) alongside PTX")
+    p.add_argument("--all-kernels", action="store_true",
+                   help="Dump all kernels in lib (default: only dump actually-used ones)")
     p.add_argument("--trace-calls", action="store_true",
                    help="Record call chains (torch → ATen → CUDA)")
     p.add_argument("--output-dir", default=None,
@@ -129,8 +131,14 @@ def run_single_gpu(args):
     # ─── PTX dump ───
     if args.dump_ptx:
         print(f"\n[4/4] Dumping PTX to {output_dir}/")
+        used_kernels = None if args.all_kernels else (
+            tracer.get_used_kernel_names() if use_tracer else None
+        )
+        if used_kernels:
+            print(f"      used-only 模式: 只保留运行时实际触发的 kernel")
         files = dump_single_gpu_ptx(config, trace_calls=args.trace_calls,
-                                     dump_sass=args.dump_sass)
+                                     dump_sass=args.dump_sass,
+                                     used_kernels=used_kernels)
         print(f"      Written {len(files)} files.")
     else:
         print(f"\n[4/4] Skipping PTX dump (use --dump-ptx to enable)")

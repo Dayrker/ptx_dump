@@ -26,6 +26,8 @@ def parse_args():
                    help="Dump NCCL PTX to nccl_ptx/")
     p.add_argument("--dump-sass", action="store_true",
                    help="Also dump SASS (GPU machine code) alongside PTX")
+    p.add_argument("--all-kernels", action="store_true",
+                   help="Dump all kernels in lib (default: only dump actually-used ones)")
     p.add_argument("--nccl-only", action="store_true",
                    help="Filter PTX to NCCL kernels only")
     p.add_argument("--trace-calls", action="store_true",
@@ -218,9 +220,15 @@ def run_dual_gpu(args):
     # ─── PTX dump (rank 0 only) ───
     if rank == 0 and args.dump_ptx:
         print(f"\n[5/5] Dumping NCCL PTX to {output_dir}/")
+        used_kernels = None if args.all_kernels else (
+            tracer.get_used_kernel_names() if use_tracer else None
+        )
+        if used_kernels:
+            print(f"      used-only 模式: 只保留运行时实际触发的 kernel")
         files = dump_dual_gpu_ptx(config, nccl_only=args.nccl_only,
                                    trace_calls=args.trace_calls,
-                                   dump_sass=args.dump_sass)
+                                   dump_sass=args.dump_sass,
+                                   used_kernels=used_kernels)
         print(f"      Written {len(files)} files.")
 
         if use_tracer:

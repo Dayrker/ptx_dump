@@ -355,6 +355,12 @@ class FullTracer:
         )
         return self._result
 
+    def get_used_kernel_names(self) -> set:
+        """Return set of demangled CUDA kernel names captured by profiler."""
+        if self._result is None:
+            self.build_chains()
+        return {k["name"] for k in self._result.get("kernel_summary", [])}
+
     def write_report(self, output_dir: str, title: str = "Call Chain Report") -> str:
         """Write complete call chain report."""
         if self._result is None:

@@ -51,6 +51,8 @@ Examples:
                        help="Dump PTX to output directory")
         p.add_argument("--dump-sass", action="store_true",
                        help="Also dump SASS (GPU machine code) alongside PTX")
+        p.add_argument("--all-kernels", action="store_true",
+                       help="Dump all kernels in lib (default: only dump actually-used ones)")
         p.add_argument("--trace-calls", action="store_true",
                        help="Record torch → ATen → CUDA call chains")
         p.add_argument("--output-dir", default=None,
@@ -95,6 +97,8 @@ Examples:
             cmd.append("--dump-ptx")
         if args.dump_sass:
             cmd.append("--dump-sass")
+        if args.all_kernels:
+            cmd.append("--all-kernels")
         if args.trace_calls:
             cmd.append("--trace-calls")
         if args.output_dir:
@@ -116,6 +120,8 @@ Examples:
             cmd.append("--dump-ptx")
         if args.dump_sass:
             cmd.append("--dump-sass")
+        if args.all_kernels:
+            cmd.append("--all-kernels")
         if args.nccl_only:
             cmd.append("--nccl-only")
         if args.trace_calls:
