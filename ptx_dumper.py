@@ -151,10 +151,10 @@ class PTXDumper:
     # ── PTX extraction ──
 
     def dump_ptx_from_lib(self, lib_path: str, label: str = "lib") -> str:
-        """Extract PTX from a .so/.cubin using cuobjdump -ptx."""
+        """Extract PTX from a .so/.cubin using cuobjdump -ptx -all."""
         try:
             result = subprocess.run(
-                [self.cuobjdump, "-ptx", lib_path],
+                [self.cuobjdump, "-ptx", "-all", lib_path],
                 capture_output=True, text=True, timeout=120,
             )
             ptx = result.stdout
@@ -196,10 +196,10 @@ class PTXDumper:
 
     def dump_sass_from_lib(self, lib_path: str, arch: str = "sm_80",
                            label: str = "lib") -> str:
-        """Extract SASS from a .so using cuobjdump -sass."""
+        """Extract SASS from a .so using cuobjdump -sass -all."""
         try:
             result = subprocess.run(
-                [self.cuobjdump, "-sass", "-arch", arch, lib_path],
+                [self.cuobjdump, "-sass", "-all", "-arch", arch, lib_path],
                 capture_output=True, text=True, timeout=600,
             )
             sass = result.stdout
