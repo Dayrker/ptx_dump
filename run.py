@@ -41,6 +41,8 @@ Examples:
     def add_common_args(p):
         p.add_argument("--model-path", default="/home/model/Qwen3-8B",
                        help="Path to Qwen3-8B model")
+        p.add_argument("--gpus", default=None,
+                       help="指定 GPU 编号，如 '0,1' 或 '2,3' (默认: 单卡='0', 双卡='0,1')")
         p.add_argument("--prompt", default=None,
                        help="Custom prompt for inference")
         p.add_argument("--max-new-tokens", type=int, default=None,
@@ -80,12 +82,14 @@ Examples:
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     if args.mode == "single":
+        gpus = args.gpus or "0"
         cmd = [
             sys.executable,
             os.path.join(script_dir, "run_single_gpu.py"),
             "--model-path", args.model_path,
             "--prompt", args.prompt,
             "--max-new-tokens", str(args.max_new_tokens),
+            "--gpus", gpus,
         ]
         if args.dump_ptx:
             cmd.append("--dump-ptx")
@@ -97,6 +101,7 @@ Examples:
             cmd.extend(["--output-dir", args.output_dir])
 
     elif args.mode == "dual":
+        gpus = args.gpus or "0,1"
         # Dual GPU needs torchrun
         cmd = [
             "torchrun",
@@ -105,6 +110,7 @@ Examples:
             "--model-path", args.model_path,
             "--prompt", args.prompt,
             "--max-new-tokens", str(args.max_new_tokens),
+            "--gpus", gpus,
         ]
         if args.dump_ptx:
             cmd.append("--dump-ptx")
@@ -119,7 +125,7 @@ Examples:
 
         # Set environment for torchrun
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "0,1"
+        env["CUDA_VISIBLE_DEVICES"] = gpus
         env["NCCL_DEBUG"] = "INFO"
         env["NCCL_DEBUG_SUBSYS"] = "INIT,COLL"
 
@@ -128,7 +134,7 @@ Examples:
         ld_path = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = f"{nccl_lib}:{ld_path}" if ld_path else nccl_lib
 
-        print("  Launching torchrun with CUDA_VISIBLE_DEVICES=0,1")
+        print(f"  Launching torchrun with CUDA_VISIBLE_DEVICES={gpus}")
         print(f"  NCCL lib: {nccl_lib}")
         print()
 

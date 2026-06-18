@@ -16,6 +16,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 def parse_args():
     p = argparse.ArgumentParser(description="Qwen3-8B single-GPU inference")
     p.add_argument("--model-path", default="/home/model/Qwen3-8B")
+    p.add_argument("--gpus", default="0",
+                   help="指定 GPU 编号，如 '0' 或 '3' (默认: '0')")
     p.add_argument("--prompt", default="请用一句话解释什么是深度学习：")
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--dump-ptx", action="store_true",
@@ -37,6 +39,9 @@ def run_single_gpu(args):
 
     # Environment
     config = setup_for_single_gpu()
+    # Override visible devices from --gpus
+    config.visible_devices = args.gpus
+    config.setup_env()
     errors = config.validate()
     if errors:
         for e in errors:

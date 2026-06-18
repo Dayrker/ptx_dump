@@ -18,6 +18,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 def parse_args():
     p = argparse.ArgumentParser(description="Qwen3-8B dual-GPU TP inference")
     p.add_argument("--model-path", default="/home/model/Qwen3-8B")
+    p.add_argument("--gpus", default="0,1",
+                   help="指定 GPU 编号，如 '0,1' 或 '2,3' (默认: '0,1')")
     p.add_argument("--prompt", default="请用一句话解释什么是分布式训练：")
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument("--dump-ptx", action="store_true",
