@@ -1,3 +1,23 @@
-# no need log
-nccl_ptx
-sass_output
+# Generated outputs
+single_ptx/
+nccl_ptx/
+sass_output/
+jit_cache/
+.jit_cache/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*~

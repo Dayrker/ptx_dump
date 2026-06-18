@@ -1,116 +1,147 @@
-# NCCL PTX/SASS Dump — Qwen3-8B 双卡推理
+# NCCL PTX Dump — Qwen3-8B Inference + PTX Extraction
+
+一键运行 Qwen3-8B 推理并 dump CUDA PTX 汇编，支持单卡和双卡模式。
 
 ## 环境
 
-| 组件 | 版本 |
-|------|------|
-| PyTorch | 2.5.1+cu121 |
-| CUDA | 12.1 |
-| NCCL | 2.21.5 |
-| GPUs | 8× A100 (sm_80) |
-| Model | Qwen3-8B |
-
-## 背景知识: NCCL 没有 PTX
-
-NCCL 发布时 **只包含预编译的 SASS** (GPU 机器码), 不包含 PTX (中间表示)。
-这是因为:
-
-1. NCCL 的 kernel 对性能极度敏感, 必须用 SASS 级别优化
-2. 发布时为每个目标架构 (sm_50 ~ sm_90) 都预编译了 SASS
-3. 没有 PTX → 无法被 cuobjdump -ptx 直接提取
-
-所以我们需要两种方法:
-
-| 方法 | 获取内容 | 命令 |
-|------|---------|------|
-| **预编译 SASS** | libnccl.so 中的 GPU 机器码汇编 | `cuobjdump -sass` |
-| **运行时 JIT PTX** | 如果 NCCL 有 JIT 编译的 kernel | `CUDA_JIT_CACHE_DIR` |
-| **重新编译 NCCL** | 完整 PTX | 从源码编译 |
-
-## 文件说明
-
-```
-nccl_ptx_dump/
-├── run_all.sh              # 一键执行全流程
-├── run_qwen3_tp.py         # Qwen3-8B 双卡 TP 推理 (触发 NCCL)
-├── nccl_allreduce_test.py  # 纯 NCCL all_reduce 压测
-├── extract_nccl_sass.sh    # 从 .so 提取 SASS
-├── capture_jit_ptx.sh      # 运行时捕获 JIT PTX
-└── README.md
-```
+| 组件 | 版本 | 路径 |
+|------|------|------|
+| PyTorch | 2.5.1+cu121 | `conda activate torch251` |
+| CUDA | 12.1 | `/usr/local/cuda-12.1` |
+| NCCL | 2.21.5 (本地编译) | `/home/zhangchen/PTX/nccl/` |
+| GPU | 8× A100 (sm_80) | — |
+| Model | Qwen3-8B | `/home/model/Qwen3-8B` |
 
 ## 快速开始
 
 ```bash
-cd ~/nccl_ptx_dump
-export CUDA_VISIBLE_DEVICES=0,1
-bash run_all.sh
+# 激活环境
+conda activate torch251
+cd ~/PTX/nccl_ptx_dump
+
+# 单卡推理 + dump 所有 PTX
+python run.py single --dump-ptx
+
+# 双卡推理 + dump NCCL PTX (只保留 NCCL 相关函数)
+python run.py dual --dump-ptx --nccl-only
+
+# 双卡推理 + dump + 调用链路追踪
+python run.py dual --dump-ptx --nccl-only --trace-calls
 ```
 
-## 单独执行
+## CLI 参考
 
-### 1. 提取预编译 SASS (A100 sm_80)
+```
+python run.py <mode> [options]
 
-```bash
-bash extract_nccl_sass.sh
+Modes:
+  single    单卡推理，PTX 输出到 single_ptx/
+  dual      双卡 TP 推理，PTX 输出到 nccl_ptx/
+
+Options:
+  --dump-ptx          开启 PTX dump
+  --nccl-only         (dual only) 只保留 NCCL 相关 kernel
+  --trace-calls       记录 torch → ATen → CUDA 调用链
+  --model-path PATH   模型路径 (默认 /home/model/Qwen3-8B)
+  --prompt TEXT       自定义输入 prompt
+  --max-new-tokens N  最大生成 token 数
+  --output-dir DIR    覆盖输出目录
 ```
 
-输出在 `sass_output/`:
-- `kernel_names.txt` — 所有 NCCL kernel 函数名
-- `nccl_sm80_sass.txt` — A100 的 SASS 汇编
-- `nccl_res_usage.txt` — 寄存器/共享内存使用
+## 输出结构
 
-### 2. 运行 NCCL all_reduce + 捕获 JIT PTX
+### 单卡模式 (`single_ptx/`)
 
-```bash
-bash capture_jit_ptx.sh
+```
+single_ptx/
+├── SUMMARY.txt           # Kernel 汇总 (名称、分类、寄存器使用)
+├── single_all.ptx        # 所有 PTX 合并 (带注释)
+├── single_001_*.ptx      # 每个 kernel 单独文件
+├── CALL_CHAINS.txt       # 调用链路 (torch → ATen → CUDA)
+└── call_chains.json      # 调用链路 (JSON 格式)
 ```
 
-### 3. Qwen3-8B 双卡推理
+### 双卡模式 (`nccl_ptx/`)
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-NCCL_DEBUG=INFO \
-torchrun --nproc_per_node=2 run_qwen3_tp.py
+```
+nccl_ptx/
+├── SUMMARY.txt           # NCCL kernel 汇总
+├── nccl_all.ptx          # 所有 NCCL PTX (带注释)
+├── nccl_001_*.ptx        # 每个 kernel 单独文件
+├── CALL_CHAINS.txt       # 调用链路 (torch → ATen → NCCL)
+└── call_chains.json      # 调用链路 (JSON 格式)
 ```
 
-## 如果确实需要 PTX (从源码编译 NCCL)
+## 架构
 
-```bash
-# 1. 克隆 NCCL 源码
-git clone https://github.com/NVIDIA/nccl.git
-cd nccl
-git checkout v2.21.5-1
-
-# 2. 编译, 保留 PTX
-make -j src.build NVCC_GENCODE="-gencode=arch=compute_80,code=compute_80"
-
-# 3. 从编译产物中提取 PTX
-cuobjdump -ptx build/lib/libnccl.so.2.21.5 > nccl_from_source.ptx
+```
+run.py                   # CLI 入口 (统一参数解析 + 调度)
+├── run_single_gpu.py    # 单卡推理 + tracing
+├── run_dual_gpu.py      # 双卡 TP 推理 + NCCL tracing
+├── env_setup.py         # 环境配置 (路径、env vars)
+├── ptx_dumper.py        # PTX 提取编排 (cuobjdump + JIT)
+├── ptx_formatter.py     # PTX 格式化 (注释、分类、分段)
+├── call_tracer.py       # 调用链路追踪 (TorchDispatchMode + profiler)
+└── symbol_utils.py      # 符号解析 (demangle + kernel 分类)
 ```
 
-> 注意: `code=compute_80` (PTX) 而非 `code=sm_80` (SASS) 是关键区别。
+## PTX 可读性增强
 
-## 常用 NCCL 环境变量
+- **符号还原**: 所有 C++ mangled name 自动 demangle
+- **指令注释**: 每条 PTX 指令标注类别 (LOAD/STORE/ARITH/SYNC...)
+- **Kernel 分类**: 自动分为 NCCL/cuBLAS/cuDNN/ATen 等类别
+- **分文件输出**: 每个 kernel 单独一个 .ptx 文件
+- **汇总表**: SUMMARY.txt 列出所有 kernel 及其元数据
 
-| 变量 | 说明 |
+## 调用链路追踪
+
+`--trace-calls` 会记录从 PyTorch 到底层的完整调用链:
+
+```
+  [1] aten::mm
+      inputs: [[4096, 4096], [4096, 4096]]
+      output: [[4096, 4096]]
+      └─→ CUDA kernels (1):
+           ├─ ampere_sgemm_128x64_tn
+           └─ ...
+
+  [42] aten::all_reduce
+      └─→ NCCL calls (1):
+           ├─ ncclDevKernel_AllReduce_Sum_f16_RING_LL
+      ┌─ PyTorch: dist.all_reduce()
+      ├─ ATen:    c10d::all_reduce / ncclAllReduce
+      ├─ NCCL:    ncclAllReduce() → Ring topology
+      └─ Kernel:  ncclDevKernel_AllReduce_Sum_f16_RING_LL
+```
+
+## 文件说明
+
+| 文件 | 用途 |
 |------|------|
-| `NCCL_DEBUG=INFO` | 打印 NCCL 初始化信息 |
-| `NCCL_DEBUG_SUBSYS=INIT,COLL,GRAPH` | 只打印指定子系统 |
-| `NCCL_ALGO=Ring,Tree` | 强制使用指定算法 |
-| `NCCL_PROTO=Simple,LL,LL128` | 强制使用指定协议 |
-| `CUDA_JIT_CACHE_DIR=/path` | JIT cache 保存路径 |
+| `run.py` | CLI 入口 — 一键跑单卡/双卡 |
+| `run_single_gpu.py` | 单卡推理 + PTX dump |
+| `run_dual_gpu.py` | 双卡 TP 推理 + NCCL PTX dump |
+| `env_setup.py` | 环境配置 — conda/CUDA/NCCL 路径 |
+| `ptx_dumper.py` | PTX 提取编排 — cuobjdump + JIT cache |
+| `ptx_formatter.py` | PTX 格式化 — 注释 + 分类 + 分文件 |
+| `call_tracer.py` | 调用链路追踪 — TorchDispatchMode + profiler |
+| `symbol_utils.py` | 符号工具 — demangle + kernel 分类 |
+| `CONTEXT.md` | 共享领域术语 (Agent-friendly) |
+| `docs/adr/` | 架构决策记录 |
 
-## NCCL Kernel 分类
+## NCCL 本地编译
 
-NCCL 的主要 kernel 家族:
+本项目使用本地编译的 NCCL 2.21.5 (`/home/zhangchen/PTX/nccl/`)。
 
-| 前缀 | 说明 | 场景 |
-|------|------|------|
-| `ncclDevKernel_Generic` | 通用 kernel | 默认算法 |
-| `ncclDevKernel_Tree*` | Tree 拓扑 | AllReduce (小规模) |
-| `ncclDevKernel_Ring*` | Ring 拓扑 | AllReduce (大规模) |
-| `ncclDevKernel_NVLS*` | NVLink SHARP | NVSwitch 加速 |
-| `*LL128*` | Low-latency 128B | 小 tensor 优化 |
-| `*LL*` | Low-latency | 小 tensor |
-| `*Simple*` | Simple protocol | 大 tensor |
+如需重新编译 (带 PTX):
+```bash
+cd ~/PTX/nccl
+make -j src.build NVCC_GENCODE="-gencode=arch=compute_80,code=compute_80"
+```
+
+> 关键: `code=compute_80` (PTX) 而非 `code=sm_80` (SASS)。
+
+## 相关文档
+
+- [CONTEXT.md](CONTEXT.md) — 共享领域术语
+- [docs/adr/](docs/adr/) — 架构决策记录
