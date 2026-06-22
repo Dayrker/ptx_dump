@@ -169,6 +169,7 @@ def run_dual_gpu(args):
         print(f"[4/5] Running inference...")
 
     use_tracer = (args.trace_calls or args.dump_ptx) and rank == 0
+    tracer = None
     chains = None
 
     if use_tracer:
@@ -192,13 +193,6 @@ def run_dual_gpu(args):
                     )
                 dist.barrier()
                 torch.cuda.synchronize()
-
-        # Build per-kernel chains (rank 0 only)
-        chains = tracer.build_chains(nccl_only=args.nccl_only)
-        if rank == 0:
-            n_nccl = sum(1 for c in chains if c.category.startswith("NCCL"))
-            print(f"      Tracing complete: {len(chains)} unique kernels chained"
-                  f" ({n_nccl} NCCL)")
     else:
         # Warmup
         with torch.no_grad():
@@ -217,6 +211,13 @@ def run_dual_gpu(args):
         dist.barrier()
         torch.cuda.synchronize()
 
+    # ─── Distributed cleanup ───
+    # Keep rank-0-only trace parsing / cuobjdump work out of NCCL barriers.
+    for h in hooks:
+        h.remove()
+    dist.barrier()
+    dist.destroy_process_group()
+
     # ─── Output ───
     if rank == 0:
         response = tokenizer.decode(
@@ -228,9 +229,16 @@ def run_dual_gpu(args):
 
     # ─── PTX dump (rank 0 only) ───
     if rank == 0 and args.dump_ptx:
+        if use_tracer and tracer is not None:
+            chains = tracer.build_chains(nccl_only=args.nccl_only)
+            n_nccl = sum(1 for c in chains if c.category.startswith("NCCL"))
+            print(f"      Tracing complete: {len(chains)} unique kernels chained"
+                  f" ({n_nccl} NCCL)")
+
         print(f"\n[5/5] Dumping NCCL PTX to {output_dir}/")
         used_kernels = None if args.all_kernels else (
-            tracer.get_used_kernel_names() if use_tracer else None
+            {c.kernel_profiler_name for c in chains}
+            if use_tracer and chains is not None else None
         )
         if used_kernels:
             print(f"      used-only 模式: 只保留运行时实际触发的 kernel")
@@ -250,17 +258,10 @@ def run_dual_gpu(args):
     elif rank == 0:
         print(f"\n[5/5] Skipping PTX dump (use --dump-ptx to enable)")
 
-    # ─── Cleanup ───
-    for h in hooks:
-        h.remove()
-    dist.barrier()
-
     if rank == 0:
         print(f"\n{'=' * 60}")
         print(f"  Done! Output: {output_dir}")
         print(f"{'=' * 60}")
-
-    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

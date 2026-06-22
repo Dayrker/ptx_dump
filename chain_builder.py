@@ -149,12 +149,145 @@ def _export_trace(prof) -> dict:
     try:
         prof.export_chrome_trace(path)
         with open(path) as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except json.JSONDecodeError as exc:
+                f.seek(0)
+                text = f.read()
+                bad_path = _save_bad_trace(path, exc)
+                trace = _recover_trace_events(text, exc)
+                if trace is not None:
+                    fallback = _trace_from_prof_events(prof)
+                    if (not _has_nccl_kernel(trace)) and _has_nccl_kernel(fallback):
+                        print(
+                            f"  [chain] warning: profiler JSON was malformed; "
+                            f"recovered trace had no NCCL kernels, using "
+                            f"profiler.events() fallback "
+                            f"(bad trace saved to {bad_path})"
+                        )
+                        return fallback
+                    print(
+                        f"  [chain] warning: profiler JSON was malformed; "
+                        f"recovered {len(trace.get('traceEvents', []))} events "
+                        f"(bad trace saved to {bad_path})"
+                    )
+                    return trace
+                print(
+                    f"  [chain] warning: profiler JSON was malformed; "
+                    f"using profiler.events() fallback "
+                    f"(bad trace saved to {bad_path})"
+                )
+                return _trace_from_prof_events(prof)
     finally:
         try:
             os.remove(path)
         except OSError:
             pass
+
+
+def _save_bad_trace(path: str, exc: json.JSONDecodeError) -> str:
+    """Keep the bad chrome trace around for later inspection."""
+    debug_dir = os.path.join(os.path.dirname(__file__), "nccl_ptx")
+    os.makedirs(debug_dir, exist_ok=True)
+    out_path = os.path.join(debug_dir, "debug_bad_trace.json")
+    with open(path, "rb") as src, open(out_path, "wb") as dst:
+        dst.write(src.read())
+    with open(out_path + ".error.txt", "w") as f:
+        f.write(f"{exc}\n")
+        f.write(f"line={exc.lineno} column={exc.colno} char={exc.pos}\n")
+    return out_path
+
+
+def _recover_trace_events(text: str, exc: json.JSONDecodeError) -> dict | None:
+    """Recover complete traceEvents before the malformed event, if possible."""
+    key_pos = text.find('"traceEvents"')
+    if key_pos < 0:
+        return None
+    start = text.find("[", key_pos)
+    if start < 0:
+        return None
+
+    decoder = json.JSONDecoder()
+    events = []
+    idx = start + 1
+    while idx < len(text):
+        while idx < len(text) and text[idx] in " \t\r\n,":
+            idx += 1
+        if idx >= len(text) or text[idx] == "]":
+            break
+        try:
+            event, idx = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            break
+        if isinstance(event, dict):
+            events.append(event)
+
+    if not events:
+        return None
+    has_kernel = any(e.get("cat") == "kernel" for e in events)
+    if not has_kernel:
+        return None
+    return {
+        "traceEvents": events,
+        "_recovered": True,
+        "_decode_error": str(exc),
+    }
+
+
+def _trace_from_prof_events(prof) -> dict:
+    """Build a reduced chrome-trace-like structure from FunctionEvent data."""
+    events = []
+    corr = 0
+
+    for ev in prof.events():
+        tr = ev.time_range
+        ts = float(tr.start)
+        dur = max(float(tr.elapsed_us()), 0.0)
+        args = {}
+        if getattr(ev, "input_shapes", None):
+            args["Input Dims"] = ev.input_shapes
+        if getattr(ev, "concrete_inputs", None):
+            args["Concrete Inputs"] = ev.concrete_inputs
+
+        events.append({
+            "cat": "cpu_op",
+            "ph": "X",
+            "name": ev.name,
+            "ts": ts,
+            "dur": dur,
+            "args": args,
+        })
+
+        for kernel in getattr(ev, "kernels", []) or []:
+            corr += 1
+            events.append({
+                "cat": "cuda_runtime",
+                "ph": "X",
+                "name": "cudaLaunchKernel",
+                "ts": ts,
+                "dur": 0.0,
+                "args": {"correlation": corr},
+            })
+            events.append({
+                "cat": "kernel",
+                "ph": "X",
+                "name": kernel.name,
+                "ts": ts,
+                "dur": float(kernel.duration),
+                "args": {
+                    "correlation": corr,
+                    "device": getattr(kernel, "device", None),
+                },
+            })
+
+    return {"traceEvents": events, "_fallback": "prof.events"}
+
+
+def _has_nccl_kernel(trace: dict) -> bool:
+    return any(
+        e.get("cat") == "kernel" and is_nccl_kernel(e.get("name", ""))
+        for e in trace.get("traceEvents", [])
+    )
 
 
 def build_chains_from_prof(prof, nccl_only: bool = False,
