@@ -52,7 +52,9 @@ class EnvConfig:
 
     def __post_init__(self):
         if not self.project_dir:
-            self.project_dir = str(Path(__file__).parent)
+            # repo root = 3 dirs up from nccl_ptx_lib/core/env_setup.py
+            # (core -> nccl_ptx_lib -> repo root); outputs land at repo root.
+            self.project_dir = str(Path(__file__).parent.parent.parent)
         if not self.single_ptx_dir:
             self.single_ptx_dir = os.path.join(self.project_dir, "single_ptx")
         if not self.nccl_ptx_dir:

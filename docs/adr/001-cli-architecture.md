@@ -21,4 +21,4 @@
 ## 影响
 - 统一入口：`python run.py <mode> [options]`
 - 双卡模式内部以子进程方式调用 `torchrun`
-- 环境配置集中在 `env_setup.py` 中管理
+- 环境配置集中在 `nccl_ptx_lib/core/env_setup.py` 中管理

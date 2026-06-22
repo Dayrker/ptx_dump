@@ -85,19 +85,31 @@ nccl_ptx/
 
 ## 架构
 
+代码按层分包 `nccl_ptx_lib/`（`run.py` 留在根目录做入口；输出目录 `single_ptx/`、
+`nccl_ptx/` 也在根目录）：
+
 ```
-run.py                   # CLI 入口 (统一参数解析 + 调度 + LD_PRELOAD)
-├── run_single_gpu.py    # 单卡推理 + tracing (cuBLAS/Triton/NCCL PTX)
-├── run_dual_gpu.py      # 双卡 TP 推理 + NCCL tracing (torchrun)
-├── env_setup.py         # 环境配置 (路径、env vars、LD_PRELOAD、自动探测 cuBLAS/Triton)
-├── call_tracer.py       # profiler 生命周期 + 调用链报告 (CALL_CHAINS.txt/json)
-├── chain_builder.py     # chrome-trace 重建 torch→aten→runtime→kernel 链路
-├── chain_model.py       # Frame/CallChain 数据模型
-├── runtime_knowledge.py # 静态 runtime 层知识表 (NCCL/cuBLAS/cuDNN/…，数据驱动)
-├── ptx_dumper.py        # PTX 提取编排 (cuobjdump + JIT/Triton + profiler↔PTX 匹配)
-├── ptx_formatter.py     # PTX 格式化 + 调用链块嵌入每个 kernel 文件
-└── symbol_utils.py      # 符号解析 (demangle + kernel 分类)
+run.py                            # CLI 入口 (统一参数解析 + 调度 + LD_PRELOAD)
+nccl_ptx_lib/
+├── core/                         # 叶子层（无内部依赖）
+│   ├── env_setup.py              # 环境配置 (路径、env vars、LD_PRELOAD、自动探测 cuBLAS/Triton)
+│   ├── symbol_utils.py           # 符号解析 (demangle + kernel 分类)
+│   └── chain_model.py            # Frame/CallChain 数据模型
+├── chain/                        # 调用链子系统（依赖 core）
+│   ├── chain_builder.py          # chrome-trace 重建 torch→aten→runtime→kernel 链路
+│   ├── runtime_knowledge.py      # 静态 runtime 层知识表 (NCCL/cuBLAS/cuDNN/…，数据驱动)
+│   └── call_tracer.py            # profiler 生命周期 + 调用链报告 (CALL_CHAINS.txt/json)
+├── ptx/                          # PTX 提取子系统（依赖 core）
+│   ├── ptx_dumper.py             # PTX 提取编排 (cuobjdump + JIT/Triton + profiler↔PTX 匹配)
+│   └── ptx_formatter.py          # PTX 格式化 + 调用链块嵌入每个 kernel 文件
+└── runners/                      # 推理编排（依赖 chain + ptx + core）
+    ├── run_single_gpu.py         # 单卡推理 + tracing (cuBLAS/Triton/NCCL PTX)
+    └── run_dual_gpu.py           # 双卡 TP 推理 + NCCL tracing (torchrun)
 ```
+
+依赖方向：`core` ← `{chain, ptx}` ← `runners` ← `run.py`，无环。各 runner 由 `run.py`
+以子进程方式启动（双卡走 `torchrun`），runner 顶部会把仓库根加入 `sys.path` 以解析
+`nccl_ptx_lib.*` 包导入。
 
 ## PTX 可读性增强
 
@@ -115,7 +127,7 @@ profiler 事件树在同一时钟上串起四类事件，按 `correlation` + 时
 ```
 [python]  modeling_qwen3.py(81): Qwen3MLP.forward → Linear.forward
 [aten]    aten::linear → aten::matmul → aten::mm   shapes=[[12,12288],[12288,4096]]
-[runtime] at::native::mm → cublasGemmEx() → ampere_*gemm_*    ← 静态知识 (runtime_knowledge.py)
+[runtime] at::native::mm → cublasGemmEx() → ampere_*gemm_*    ← 静态知识 (nccl_ptx_lib/chain/runtime_knowledge.py)
 [launch]  cudaLaunchKernel  corr=26153
 [kernel]  ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_...
 [ptx]     single_001_..._.ptx
@@ -138,7 +150,7 @@ NCCL 的链路覆盖 `docs/allreduce-deep-dive.md` 的全部 9 层：
 - **python / aten / launch / kernel / ptx** 层来自 `torch.profiler` chrome trace
   （`python_function` / `cpu_op` / `cuda_runtime` / `kernel` 四类事件）。
 - **runtime** 层（ProcessGroupNCCL→ncclAllReduce→…、cublasGemmEx→…）profiler
-  看不到，是 `runtime_knowledge.py` 里的数据驱动静态知识表。
+  看不到，是 `nccl_ptx_lib/chain/runtime_knowledge.py` 里的数据驱动静态知识表。
 - 链路写在每个 per-kernel `.ptx` 文件头部，也汇总在 `CALL_CHAINS.txt` /
   `call_chains.json`。
 - 「一路链接都写上」指的是：从 torch 算子、ATen 算子、底层 runtime、kernel launch、
@@ -164,13 +176,15 @@ NCCL 的链路覆盖 `docs/allreduce-deep-dive.md` 的全部 9 层：
 | 文件 | 用途 |
 |------|------|
 | `run.py` | CLI 入口 — 一键跑单卡/双卡 |
-| `run_single_gpu.py` | 单卡推理 + PTX dump |
-| `run_dual_gpu.py` | 双卡 TP 推理 + NCCL PTX dump |
-| `env_setup.py` | 环境配置 — conda/CUDA/NCCL 路径 |
-| `ptx_dumper.py` | PTX 提取编排 — cuobjdump + JIT cache |
-| `ptx_formatter.py` | PTX 格式化 — 注释 + 分类 + 分文件 |
-| `call_tracer.py` | 调用链路追踪 — TorchDispatchMode + profiler |
-| `symbol_utils.py` | 符号工具 — demangle + kernel 分类 |
+| `nccl_ptx_lib/runners/run_single_gpu.py` | 单卡推理 + PTX dump |
+| `nccl_ptx_lib/runners/run_dual_gpu.py` | 双卡 TP 推理 + NCCL PTX dump |
+| `nccl_ptx_lib/core/env_setup.py` | 环境配置 — conda/CUDA/NCCL 路径 |
+| `nccl_ptx_lib/ptx/ptx_dumper.py` | PTX 提取编排 — cuobjdump + JIT cache |
+| `nccl_ptx_lib/ptx/ptx_formatter.py` | PTX 格式化 — 注释 + 分类 + 分文件 |
+| `nccl_ptx_lib/chain/call_tracer.py` | 调用链路追踪 — profiler chrome trace |
+| `nccl_ptx_lib/chain/chain_builder.py` | 调用链重建 — torch→aten→runtime→kernel |
+| `nccl_ptx_lib/chain/runtime_knowledge.py` | 静态 runtime 层知识表 (NCCL/cuBLAS/…) |
+| `nccl_ptx_lib/core/symbol_utils.py` | 符号工具 — demangle + kernel 分类 |
 | `CONTEXT.md` | 共享领域术语 (Agent-friendly) |
 | `docs/adr/` | 架构决策记录 |
 
@@ -190,7 +204,7 @@ NCCL 的链路覆盖 `docs/allreduce-deep-dive.md` 的全部 9 层：
 
 torch 的 `libtorch_cuda.so` 带 `DT_RPATH` 指向 pip 装的 `nvidia-nccl-cu12`，且
 `DT_RPATH` **优先于** `LD_LIBRARY_PATH`——光设 `LD_LIBRARY_PATH` 不够。
-本项目在 `env_setup.py` / `run.py` 里设 `LD_PRELOAD` 指向本地 `libnccl.so.2`，
+本项目在 `nccl_ptx_lib/core/env_setup.py` / `run.py` 里设 `LD_PRELOAD` 指向本地 `libnccl.so.2`，
 `LD_PRELOAD` 优先于 `DT_RPATH`。`/proc/<pid>/maps` 可验证加载的是本地版。
 
 ### PTX 与 SASS 的区别

@@ -9,7 +9,7 @@ with demangled names, section headers, and instruction comments.
 import re
 import os
 from typing import Optional, Dict, List
-from symbol_utils import demangle_symbol, classify_kernel, format_kernel_header, extract_kernel_metadata
+from nccl_ptx_lib.core.symbol_utils import demangle_symbol, classify_kernel, format_kernel_header, extract_kernel_metadata
 
 # Avoid a hard import cycle: chain_model is imported lazily where needed.
 def _chain_header_for(mangled_name: str, chains) -> str:
@@ -17,7 +17,7 @@ def _chain_header_for(mangled_name: str, chains) -> str:
     if not chains:
         return ""
     try:
-        from chain_model import format_chain_header
+        from nccl_ptx_lib.core.chain_model import format_chain_header
     except Exception:
         return ""
     chain = chains.get(mangled_name)

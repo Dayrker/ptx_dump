@@ -9,6 +9,11 @@ import os
 import sys
 import argparse
 
+# This script is launched as a subprocess (python <path>) by run.py, so the
+# package root (repo root) isn't automatically on sys.path. Put it there.
+# repo root = 3 dirs up: runners -> nccl_ptx_lib -> root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -35,9 +40,9 @@ def parse_args():
 
 def run_single_gpu(args):
     """Run single-GPU inference with optional tracing."""
-    from env_setup import EnvConfig, setup_for_single_gpu, setup_jit_cache
-    from ptx_dumper import dump_single_gpu_ptx
-    from call_tracer import full_trace_context
+    from nccl_ptx_lib.core.env_setup import EnvConfig, setup_for_single_gpu, setup_jit_cache
+    from nccl_ptx_lib.ptx.ptx_dumper import dump_single_gpu_ptx
+    from nccl_ptx_lib.chain.call_tracer import full_trace_context
 
     # Environment
     config = setup_for_single_gpu()

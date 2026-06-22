@@ -10,6 +10,11 @@ import os
 import sys
 import argparse
 
+# Launched as a subprocess via torchrun, so the package root (repo root) isn't
+# automatically on sys.path. Put it there.
+# repo root = 3 dirs up: runners -> nccl_ptx_lib -> root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -94,9 +99,9 @@ def apply_tensor_parallelism(model, rank, world_size):
 
 def run_dual_gpu(args):
     """Run dual-GPU TP inference with NCCL tracing."""
-    from env_setup import EnvConfig, setup_for_dual_gpu, setup_jit_cache
-    from ptx_dumper import dump_dual_gpu_ptx
-    from call_tracer import full_trace_context
+    from nccl_ptx_lib.core.env_setup import EnvConfig, setup_for_dual_gpu, setup_jit_cache
+    from nccl_ptx_lib.ptx.ptx_dumper import dump_dual_gpu_ptx
+    from nccl_ptx_lib.chain.call_tracer import full_trace_context
 
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")

@@ -3,7 +3,7 @@
 从 `dist.all_reduce()` 到 `ncclDevKernel_AllReduce_Sum_f32_RING_LL` 的完整调用链。
 
 > **机器消费 & 实测验证（2026-06-21 更新）**
-> - 本文档现在是**机器消费**的：`runtime_knowledge.py` 的 AllReduce `RuntimeRule`
+> - 本文档现在是**机器消费**的：`nccl_ptx_lib/chain/runtime_knowledge.py` 的 AllReduce `RuntimeRule`
 >   把这里的 9 层编码进调用链产物（把文档 Layer 2 / Layer 5 各拆成两层）。
 > - 已对照双卡 Qwen3-8B trace 实测验证（`nccl_ptx/call_chains.json`）：
 >   两条匹配上的 NCCL 链路都复现了 9 层顺序——
@@ -741,7 +741,7 @@ struct RunWorkElement<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL
 > **algo 派发**：`RunWorkElement` 按 `Algo` 模板参数特化——`NCCL_ALGO_RING → runRing`，
 > `NCCL_ALGO_TREE → runTree`（`getPatternInfo` `enqueue.cc:1633` 把
 > `AllReduce+TREE → ncclPatternTreeUpDown`）。algo 编码在 kernel 名后缀里
-> （`_RING` / `_TREE`），所以 `runtime_knowledge.py` 据此特化末层：
+> （`_RING` / `_TREE`），所以 `nccl_ptx_lib/chain/runtime_knowledge.py` 据此特化末层：
 > `_RING → RunWork<…>::run() → runRing<Proto>`、`_TREE → … → runTree`。
 
 ### 10.3 runRing — Ring AllReduce 核心算法 (LL 协议)

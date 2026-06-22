@@ -18,9 +18,9 @@ import glob
 import subprocess
 from typing import Optional
 
-from env_setup import EnvConfig
-from symbol_utils import is_nccl_kernel, demangle_symbol, extract_kernel_metadata
-from ptx_formatter import format_ptx_section, write_formatted_ptx
+from nccl_ptx_lib.core.env_setup import EnvConfig
+from nccl_ptx_lib.core.symbol_utils import is_nccl_kernel, demangle_symbol, extract_kernel_metadata
+from nccl_ptx_lib.ptx.ptx_formatter import format_ptx_section, write_formatted_ptx
 
 
 # ─── SASS Formatter ──────────────────────────────────────────────────
@@ -96,7 +96,7 @@ def write_formatted_sass(sass_text: str, output_dir: str, prefix: str = "dump",
         "",
     ]
 
-    from symbol_utils import classify_kernel
+    from nccl_ptx_lib.core.symbol_utils import classify_kernel
     categories = {}
     for k in kernels:
         cat = classify_kernel(k["name"])
@@ -446,7 +446,7 @@ class PTXDumper:
 
         Returns: (filtered_text, kept_count, total_count)
         """
-        from ptx_formatter import _split_ptx_into_kernels
+        from nccl_ptx_lib.ptx.ptx_formatter import _split_ptx_into_kernels
 
         kernel_blocks = _split_ptx_into_kernels(ptx_text)
         if not kernel_blocks:
@@ -558,7 +558,7 @@ def match_chain_to_ptx(chain, ptx_entries: list) -> bool:
     'ncclDevKernel_AllReduce_Sum_f16_RING_LL'); PTX .entry names are mangled.
     We compare on the function-name token, ignoring template/param suffixes.
     """
-    from symbol_utils import demangle_symbol, is_nccl_kernel
+    from nccl_ptx_lib.core.symbol_utils import demangle_symbol, is_nccl_kernel
     prof_name = (chain.kernel_profiler_name or "").strip()
 
     # The "func token" = the part before the first '(' or '<' (templates/params).

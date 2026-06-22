@@ -35,9 +35,9 @@ from typing import List, Optional
 
 from torch.profiler import profile, ProfilerActivity
 
-from chain_model import CallChain, chain_to_jsonable
-from chain_builder import build_chains_from_prof
-from symbol_utils import is_nccl_kernel
+from nccl_ptx_lib.core.chain_model import CallChain, chain_to_jsonable
+from nccl_ptx_lib.chain.chain_builder import build_chains_from_prof
+from nccl_ptx_lib.core.symbol_utils import is_nccl_kernel
 
 
 class FullTracer:

@@ -33,7 +33,7 @@ cuda_runtime.ts      ─contains──▶ cpu_op[ts, ts+dur]   (ATen op(s))
 innermost cpu_op.ts  ─contains──▶ enclosing python_function 帧
 ```
 
-见 `chain_builder.py`。
+见 `nccl_ptx_lib/chain/chain_builder.py`。
 
 ### 为什么不用 `FunctionEvent.stack` / `_get_kineto_results`
 torch 2.5.1 中 `FunctionEvent.stack` **恒为空**（即使 `with_stack=True`）；
@@ -44,7 +44,7 @@ chrome trace 的 `python_function` 事件才是 Python 层的可靠来源。
 profiler 只能看到 torch 算子、ATen op、`cudaLaunchKernel`、device kernel。
 ATen 与 kernel 之间的 C++ runtime（`ProcessGroupNCCL::allreduce` →
 `ncclAllReduce` → `ncclEnqueueCheck` → … ；`cublasGemmEx` → …）无法观测，
-但每个 kernel 族是确定性的。`runtime_knowledge.py` 用数据驱动的
+但每个 kernel 族是确定性的。`nccl_ptx_lib/chain/runtime_knowledge.py` 用数据驱动的
 `RuntimeRule` 表编码这些层（NCCL 路径源自 `docs/allreduce-deep-dive.md` 的
 9 层全链路）。
 
@@ -63,5 +63,5 @@ ATen 与 kernel 之间的 C++ runtime（`ProcessGroupNCCL::allreduce` →
 - 每个 per-kernel `.ptx` 文件头部嵌入其调用链块；`CALL_CHAINS.txt` /
   `call_chains.json` 汇总。
 - cuBLAS profiler 名称（`ampere_*gemm*`）与 PTX `.entry` mangled 符号不是 1:1，
-  按 *族*（gemm/elementwise/reduce…）匹配，见 `ptx_dumper.match_chain_to_ptx`。
+  按 *族*（gemm/elementwise/reduce…）匹配，见 `nccl_ptx_lib/ptx/ptx_dumper.py` 的 `match_chain_to_ptx`。
 - 双卡仅 rank 0 追踪；NCCL kernel 符号跨 rank 一致，PTX 来自本地 `libnccl.so`。

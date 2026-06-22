@@ -33,10 +33,10 @@ import tempfile
 from collections import defaultdict
 from typing import List
 
-from chain_model import (CallChain, Frame, Caller,
+from nccl_ptx_lib.core.chain_model import (CallChain, Frame, Caller,
                          LAYER_PYTHON, LAYER_ATEN, LAYER_LAUNCH, LAYER_KERNEL)
-from symbol_utils import is_nccl_kernel, classify_kernel
-import runtime_knowledge
+from nccl_ptx_lib.core.symbol_utils import is_nccl_kernel, classify_kernel
+import nccl_ptx_lib.chain.runtime_knowledge as runtime_knowledge
 
 
 # ─── Interval index (time containment) ─────────────────────────────────
@@ -187,7 +187,10 @@ def _export_trace(prof) -> dict:
 
 def _save_bad_trace(path: str, exc: json.JSONDecodeError) -> str:
     """Keep the bad chrome trace around for later inspection."""
-    debug_dir = os.path.join(os.path.dirname(__file__), "nccl_ptx")
+    # repo root = 3 dirs up from nccl_ptx_lib/chain/chain_builder.py
+    # (chain -> nccl_ptx_lib -> root); debug dump goes to the root nccl_ptx/ dir.
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    debug_dir = os.path.join(repo_root, "nccl_ptx")
     os.makedirs(debug_dir, exist_ok=True)
     out_path = os.path.join(debug_dir, "debug_bad_trace.json")
     with open(path, "rb") as src, open(out_path, "wb") as dst:

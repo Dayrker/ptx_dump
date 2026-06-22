@@ -94,7 +94,7 @@ Examples:
         gpus = args.gpus or "0"
         cmd = [
             sys.executable,
-            os.path.join(script_dir, "run_single_gpu.py"),
+            os.path.join(script_dir, "nccl_ptx_lib", "runners", "run_single_gpu.py"),
             "--model-path", args.model_path,
             "--prompt", args.prompt,
             "--max-new-tokens", str(args.max_new_tokens),
@@ -117,7 +117,7 @@ Examples:
         cmd = [
             "torchrun",
             "--nproc_per_node=2",
-            os.path.join(script_dir, "run_dual_gpu.py"),
+            os.path.join(script_dir, "nccl_ptx_lib", "runners", "run_dual_gpu.py"),
             "--model-path", args.model_path,
             "--prompt", args.prompt,
             "--max-new-tokens", str(args.max_new_tokens),

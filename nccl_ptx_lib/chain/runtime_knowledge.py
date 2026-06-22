@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from typing import List, Optional
 
-from chain_model import Frame, LAYER_RUNTIME
-from symbol_utils import is_nccl_kernel, classify_kernel
+from nccl_ptx_lib.core.chain_model import Frame, LAYER_RUNTIME
+from nccl_ptx_lib.core.symbol_utils import is_nccl_kernel, classify_kernel
 
 
 @dataclass
