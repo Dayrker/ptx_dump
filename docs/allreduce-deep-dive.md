@@ -2,6 +2,18 @@
 
 从 `dist.all_reduce()` 到 `ncclDevKernel_AllReduce_Sum_f32_RING_LL` 的完整调用链。
 
+> **机器消费 & 实测验证（2026-06-21 更新）**
+> - 本文档现在是**机器消费**的：`runtime_knowledge.py` 的 AllReduce `RuntimeRule`
+>   把这里的 9 层编码进调用链产物（把文档 Layer 2 / Layer 5 各拆成两层）。
+> - 已对照双卡 Qwen3-8B trace 实测验证（`nccl_ptx/call_chains.json`）：
+>   两条匹配上的 NCCL 链路都复现了 9 层顺序——
+>   ① f16 RING_LL（MLP `dist.all_reduce`，`shape=[1,16,4096]`，`grid=[16,1,1]`，`block=[512,1,1]`，`smem=88416`）；
+>   ② f32 RING_LL（`dist.barrier`，`count=1`，`grid=[1,1,1]`，`block=[96,1,1]`，`smem=88416`）。
+> - 实测**证实**：「双卡选 RING+LL」「9 层顺序」「mangled 符号」「18 条 ld/st.volatile.global」。
+> - 实测**推翻**并已下文更正：`block=640`、`smem=0(LL)`、「<几KB→TREE+LL」。
+> - 注意：第 9 层设备派发按 algo 后缀特化（`_RING→runRing`、`_TREE→runTree`）；
+>   本地构建只特化了 **LL** collective kernel（LL128/SIMPLE 走通用 `ncclDevKernel_Generic`）。
+
 ---
 
 ## 目录
@@ -57,8 +69,9 @@ Layer 6: ncclLaunchPrepare → scheduleCollTasksToPlan            [调度]
   │
   ▼
 Layer 7: ncclLaunchKernel(comm, plan)                           [launch]
-  │  → grid = {channelCount, 1, 1}
-  │  → block = {640, 1, 1}
+  │  → grid = {channelCount, 1, 1}          // 数据量相关 (实测 f16=16, barrier=1)
+  │  → block = {threadPerBlock, 1, 1}       // LL 上限 512, 调谐到 ≥96 (实测 f16=512, barrier=96)
+  │  → smem = ncclShmemDynamicSize()        // 协议无关, sm_80 ≈ 88416 (实测)
   │  → args = {&devComm, &channelMask, &workHead}
   │  → cudaLaunchKernelExC(...) / cudaLaunchKernel(...)
   │
@@ -69,9 +82,26 @@ Layer 8: ncclDevKernel_AllReduce_Sum_f32_RING_LL                [__global__]
   │
   ▼
 Layer 9: RunWork<AllReduce, f32, Sum, RING, LL>::run()          [device]
-  │  → runRing<f32, Sum, ProtoLL>(args)
+  │  → runRing<f32, Sum, ProtoLL>(args)      // _RING → runRing; _TREE → runTree
   │  → Primitives: send → recvReduceSend → ... → recv
 ```
+
+### barrier 变体（同一条 NCCL 机器，不同入口）
+
+NCCL **没有** `ncclBarrier` / `ncclFuncBarrier` collective（`grep src/` 无此符号）。
+`torch.distributed.barrier()` 复用 AllReduce 机器：在缓存的 1 元素 `barrierTensor_`
+上跑一次 `ncclAllReduce(ncclFuncAllReduce)`。所以 **Layer 4–9 与 `dist.all_reduce()`
+完全相同**，只有入口两层不同：
+
+```
+Layer 1: torch.distributed.barrier()                             [Python]   (c10d/distributed_c10d.py:4122)
+Layer 2: ProcessGroupNCCL::barrier()                             [C++]      (header:610, 用 barrierTensor_ @358)
+   └→ allreduce_impl(barrierTensor_, opts) → collective() → ncclAllReduce(...)   ← 接回 Layer 4
+```
+
+实测：`dist.barrier()` 触发的 `ncclDevKernel_AllReduce_Sum_f32_RING_LL`（`count=1`，
+`corr=28537`）就是这条路径。工具默认把这类 barrier 同步 kernel 排除在 used-only 集合
+外（见 `docs/adr/003-call-chain-tracing.md` 的 `--include-sync-kernels`）。
 
 ---
 
@@ -327,8 +357,10 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
   info->nThreads = 0;
   info->algorithm = NCCL_ALGO_UNDEF;   // 算法待选择
   info->protocol = NCCL_PROTO_UNDEF;   // 协议待选择
+  info->userTuned = false;             // 未用用户 tuner (enqueue.cc:1972)
   memcpy(t, info, sizeof(struct ncclInfo));
   ncclIntruQueueSortEnqueue(&tasks->collQueue, t, collCmp);
+  // (随后还有 stream 追踪尾巴 :1980-2003, 此处省略)
 }
 ```
 
@@ -391,6 +423,12 @@ ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm,
 }
 ```
 
+> 注：上面 ⑤⑥⑦ 其实跑在各 `add*ToPlan` 辅助函数里（`addCBDCollToPlan`
+> `enqueue.cc:844`、`addCollnetCollToPlan :855`、`addTunedCollToPlan :865`），
+> `scheduleCollTasksToPlan` 按拓扑派发到其中之一。`computeCollChunkInfo` 在
+> `:276/:348/:450`，`initCollWorkElem` 在 `:277/:349/:452`。引用的 `743-870` 行段准确，
+> 此处为忠实简化。
+
 ### 7.2 ncclDevFuncId — 函数索引映射
 
 ```c
@@ -409,14 +447,19 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
 
 **示例：** AllReduce + Sum + f32 + RING + LL
 ```
-devRedOp = ncclDevSum = 0
-type = ncclFloat32 = 6 (在 nccl 类型枚举中的位置)
-algo = NCCL_ALGO_RING = 0
-proto = NCCL_PROTO_LL = 0
+devRedOp = ncclDevSum   = 0   // device.h:27
+type     = ncclFloat32  = 7   // nccl.h.in:213  (注意 ncclFloat16=6 @:211)
+algo     = NCCL_ALGO_RING = 1 // nccl_common.h:31  (NCCL_ALGO_TREE=0 @:30)
+proto    = NCCL_PROTO_LL  = 0 // nccl_common.h:39
 
-row = ((0 * 10 + 6) * 6 + 0) * 3 + 0 = 108
-funcIndex = ncclDevFuncRowToId[108]
+row = ((devRedOp * 10 + type) * 6 + algo) * 3 + proto
+    = ((0   * 10 + 7)    * 6 + 1)   * 3 + 0
+    = (7 * 6 + 1) * 3 = 43 * 3 = 129
+funcIndex = ncclDevFuncRowToId[129]
 ```
+
+> 注：早先版本误把 `ncclFloat32` 写成 6、`NCCL_ALGO_RING` 写成 0，算出 `row=108`，
+> 已据 `nccl.h.in` / `nccl_common.h` 实际枚举更正为 `row=129`。
 
 ### 7.3 initCollWorkElem — 工作元素构造
 
@@ -438,15 +481,32 @@ static ncclResult_t initCollWorkElem(struct ncclInfo* collInfo,
 
 ### 7.4 算法选择策略
 
-| 条件 | 选择算法 | 选择协议 |
-|------|---------|---------|
-| 小数据 (< 几百 KB) | RING | LL 或 LL128 |
-| 中等数据 | RING | SIMPLE |
-| 极小数据 (< 几 KB) | TREE | LL |
+真实选择器是 `topoGetAlgoInfo`（`src/enqueue.cc:1484-1538`）：**暴力遍历所有
+algo×proto 组合**，对每个组合调 `ncclTopoGetAlgoTime` 估时，取**最小时间**的那一对。
+不是按数据量查表。
+
+实测（双卡 Qwen3-8B，2 rank / 单节点 / NVLink）：
+
+| 触发 | shape | count (元素) | 选中 algo×proto | 备注 |
+|------|-------|------------|-----------------|------|
+| MLP `dist.all_reduce` (f16) | `[1,16,4096]` | 65536 (131072 B) | **RING + LL** | `grid=[16,1,1]` |
+| `dist.barrier` (f32) | `[1]` | 1 (4 B) | **RING + LL** | `grid=[1,1,1]` |
+
+可见在 2 rank / NVLink 拓扑下，**连 4 字节的极小消息都选 RING+LL**——RING 的
+每跳延迟在该拓扑下低于 TREE。下表是「经验性启发」，**不保证与真实选择器一致**，
+仅作粗略参考：
+
+| 经验条件 | 常见 algo | 常见 proto |
+|---------|----------|----------|
+| 小~中数据 | RING | LL / LL128 |
+| 大数据 | RING / NVLS | SIMPLE |
 | NVSwitch 可用 + 大数据 | NVLS | SIMPLE |
 | CollNet 可用 | COLLNET_DIRECT | SIMPLE |
 
-对于 Qwen3-8B 双卡推理，通常 tensor 较小 → **RING + LL**。
+> 注：本地 `libnccl.so` **编译进**了 `AllReduce_Sum_{u8,f16,f32,f64,u32,u64,bf16}_{RING,TREE}_LL`
+> 共 14 个特化 collective kernel，但 `topoGetAlgoInfo` 在 2 rank/NVLink 下**只选中
+> RING+LL**——TREE kernel 编译了却没被选。`nccl_ptx/` 的 used-only 过滤因此只保留
+> 实际 launch 的 2 个 RING_LL kernel。
 
 ---
 
@@ -462,12 +522,19 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm,
 
   cudaStream_t launchStream = tasks->streams->stream;
 
-  dim3 grid  = {(unsigned)plan->channelCount, 1, 1};   // 每个 channel 一个 block
-  dim3 block = {(unsigned)plan->threadPerBlock, 1, 1}; // = NCCL_MAX_NTHREADS = 640
+  dim3 grid  = {(unsigned)plan->channelCount, 1, 1};   // 每个 channel 一个 block (数据量相关)
+  dim3 block = {(unsigned)plan->threadPerBlock, 1, 1}; // LL 上限 512, 经 getChannnelThreadInfo 调谐
 
   size_t smem = ncclShmemDynamicSize(comm->cudaArch);
-  // LL 协议: smem = 0 (LL 不需要额外 scratch)
-  // LL128/SIMPLE: smem > 0 (需要 per-warp scratch buffer)
+  // ⚠ 协议无关: 取所有协议的 max (见 device.h:395-408)
+  //   ncclShmemScratchWarpSize = max_constexpr{
+  //     LL: 0,                                 ← LL 分支确实是 0
+  //     LL128: (NCCL_LL128_SHMEM_ELEMS_PER_THREAD*WARP_SIZE)*sizeof(uint64_t),
+  //     SIMPLE:(ncclCollUnroll*WARP_SIZE+1)*16,
+  //     NVLS:  ... }
+  //   → max 取 SIMPLE 的非零值, 对**所有** kernel (含 LL 特化) 都返回非零
+  //   smem = warpScratch * (NCCL_MAX_NTHREADS/WARP_SIZE)  // device.h:406-408
+  //   sm_80 上 ≈ 88416 字节 (实测 f16 allreduce 与 f32 barrier 的 RING_LL 都是 88416)
 
   // ★ 三个 kernel 参数 ★
   void *args[3] = {
@@ -503,9 +570,12 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm,
 | `comm->devComm` | `ncclDevComm*` | `ncclCommInitRank()` 时构建，存在 device memory 上 |
 | `plan->channelMask` | `uint64_t` | 每 bit 代表一个 channel 是否参与此次操作 |
 | `plan->workHead` | `ncclWork*` | `uploadWork()` 写入 workFifo 后的头指针 |
-| `grid` | `{channelCount, 1, 1}` | 通常 1~2 (Qwen3-8B 双卡一般 1 个 channel) |
-| `block` | `{640, 1, 1}` | `NCCL_MAX_NTHREADS` 固定 640 |
-| `smem` | 0 (LL) | `ncclShmemDynamicSize()` 计算 |
+| `grid` | `{channelCount, 1, 1}` | 数据量相关，`getChannnelThreadInfo`(`enqueue.cc:1574-1588`) 决定；实测 f16 allreduce=16, f32 barrier=1 |
+| `block` | `{threadPerBlock, 1, 1}` | LL 上限 `NCCL_LL_MAX_NTHREADS=512`(`device.h:57`)，`getChannnelThreadInfo`(`enqueue.cc:1601-1614`) 按数据量减半，最低 3-warp=96；实测 f16=512, f32 barrier=96 |
+| `smem` | ≈88416 (sm_80) | `ncclShmemDynamicSize()`，**协议无关**取 max（见上），含 LL 特化 kernel；不是 0 |
+
+> 注：早先版本把 `block` 写成「`NCCL_MAX_NTHREADS` 固定 640」、`smem` 写成「0 (LL)」，
+> 均与实测/源码不符，已更正。640 是 LL128/SIMPLE/NVLS 的上限；LL 用 512 并调谐。
 
 ### uploadWork — 工作上传
 
@@ -659,7 +729,7 @@ struct RunWork {
 ### 10.2 RunWorkElement — AllReduce Ring LL 的实现
 
 ```c
-// all_reduce.h:716-722
+// all_reduce.h:716-721
 template<typename T, typename RedOp>
 struct RunWorkElement<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL> {
   __device__ __forceinline__ void run(ncclWorkElem *args) {
@@ -667,6 +737,12 @@ struct RunWorkElement<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL
   }
 };
 ```
+
+> **algo 派发**：`RunWorkElement` 按 `Algo` 模板参数特化——`NCCL_ALGO_RING → runRing`，
+> `NCCL_ALGO_TREE → runTree`（`getPatternInfo` `enqueue.cc:1633` 把
+> `AllReduce+TREE → ncclPatternTreeUpDown`）。algo 编码在 kernel 名后缀里
+> （`_RING` / `_TREE`），所以 `runtime_knowledge.py` 据此特化末层：
+> `_RING → RunWork<…>::run() → runRing<Proto>`、`_TREE → … → runTree`。
 
 ### 10.3 runRing — Ring AllReduce 核心算法 (LL 协议)
 
@@ -927,12 +1003,14 @@ ncclWork work = {
   },
   .elems[0] = {
     .isUsed = 1,
-    .nWarps = 20,               // 640 threads / 32 = 20 warps
+    .nWarps = 16,               // = block/32; LL 上限 512 → 16 warps (实测 f16 allreduce)
+                               //   barrier 用 block=96 → nWarps=3
     .sendbuff = d_sendbuff,     // 输入数据
     .recvbuff = d_recvbuff,     // 输出数据
-    .count = 4096,              // 元素个数
+    .count = 65536,             // 元素个数 (实测 f16 allreduce, shape [1,16,4096])
+                               //   barrier: count=1 (shape [1])
     .chunkCount = ...,          // 根据 count/nRanks/nChannels 计算
-    .workCount = 4096,
+    .workCount = 65536,
     .workOffset = 0,
   },
 };
@@ -970,14 +1048,15 @@ cuMemcpyHtoD(d_devComm, &devComm, sizeof(ncclDevComm));
 cuMemcpyHtoD(d_channel, &channel, sizeof(ncclDevChannel));
 cuMemcpyHtoD(d_work, &work, sizeof(ncclWork));
 
-// 4. Launch kernel
-uint64_t channelMask = 0x1;  // 只用 channel 0
+// 4. Launch kernel  (以 f16 allreduce, 16 channel 为例)
+uint64_t channelMask = 0xFFFF;  // 16 个 channel 全活跃
 void* args[3] = {&d_devComm, &channelMask, &d_work};
 cuLaunchKernel(kernel,
-    1, 1, 1,       // grid: 1 block (1 channel)
-    640, 1, 1,     // block: 640 threads
-    0,             // shared mem: 0 (LL 协议)
+    16, 1, 1,      // grid: 16 blocks (16 channels, 数据量相关)
+    512, 1, 1,     // block: 512 threads (LL 上限 NCCL_LL_MAX_NTHREADS, device.h:57)
+    88416,         // shared mem: ncclShmemDynamicSize() ≈ 88416 (协议无关, sm_80)
     stream, args, NULL);
+//   barrier 变体: grid=1, block=96, smem 仍 88416, count=1
 
 // 5. 同步
 cuCtxSynchronize();
@@ -989,6 +1068,8 @@ cuCtxSynchronize();
 
 2. **ld/st.volatile.global 是通信核心** — 这些指令读写的是 peer GPU 的 ring buffer 地址，通过 NVLink/PCIe 的 P2P 映射实现跨 GPU 访问。必须正确设置 P2P 内存映射。
 
-3. **bar.sync 的线程数** — 除了 `bar.sync 0`（全 block 640 线程）外，还有 `bar.sync %r241, %r14` 这种寄存器指定线程数的形式，是 NCCL 的 warp 分工机制。
+3. **bar.sync 的线程数** — 除了 `bar.sync 0`（全 block 同步，线程数 = block，非固定 640；LL 上限 512，barrier 调谐到 96）外，还有 `bar.sync %r241, %r14` 这种寄存器指定线程数的形式，是 NCCL 的 warp 分工机制。
 
-4. **channelMask 与 grid 的对应** — `channelMask = 0x1` 意味着只有 channel 0 活跃，`grid.x = 1`。kernel 内部用 `__popcll` 计算 blockIdx 到 channelId 的映射。
+4. **channelMask 与 grid 的对应** — `channelMask` 每个 bit 代表一个活跃 channel，`grid.x = popcount(channelMask)`。kernel 内部用 `__popcll` 计算 blockIdx 到 channelId 的映射。f16 allreduce `channelMask=0xFFFF, grid=16`；barrier `channelMask=0x1, grid=1`。
+
+5. **本地构建只特化 LL collective kernel** — `libnccl.so` 里的 collective `.entry` 符号都以 `_LL` 结尾（`AllReduce_Sum_{f16,f32,…}_{RING,TREE}_LL` 等）。**LL128 / SIMPLE** 协议的 AllReduce **不走特化 kernel**，而是派发到通用 `ncclDevKernel_Generic`（通过 `ncclDevFuncTable[]` 间接调用，即 `ncclKernelMain` 的慢速路径）。所以独立跑 LL128/SIMPLE 的 PTX 时**不能复用特化 `.entry`**，得用 Generic kernel 的 PTX。

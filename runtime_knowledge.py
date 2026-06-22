@@ -52,9 +52,9 @@ def _nccl_common_tail(coll_label: str, dev_layer: str) -> List[RuntimeLayer]:
         RuntimeLayer("taskAppend()",
                      notes="join group; sort-into collQueue"),
         RuntimeLayer("scheduleCollTasksToPlan()",
-                     notes="topoGetAlgoInfo (RING/TREE/NVLS); ncclDevFuncId; initCollWorkElem; uploadWork"),
+                     notes="topoGetAlgoInfo brute-force min-time (RING/TREE/NVLS); ncclDevFuncId; initCollWorkElem; uploadWork"),
         RuntimeLayer("ncclLaunchKernel()",
-                     notes="grid={channelCount}; block={640}; cudaLaunchKernelExC"),
+                     notes="grid={channelCount}; block={LL≤512, tuned≥96}; smem=ncclShmemDynamicSize(); cudaLaunchKernelExC"),
         RuntimeLayer("ncclKernelMain<…>()  [device entry]",
                      notes="blockIdx→channelId; load devComm/channel/work → shared mem"),
         RuntimeLayer(dev_layer,
@@ -62,8 +62,36 @@ def _nccl_common_tail(coll_label: str, dev_layer: str) -> List[RuntimeLayer]:
     ]
 
 
+def _algo_from_kernel(kernel_name: str) -> str:
+    """Recover the NCCL algo from the specialized kernel name suffix
+    (ncclDevKernel_AllReduce_Sum_f16_RING_LL → 'RING')."""
+    n = (kernel_name or "").upper()
+    for algo in ("RING", "TREE", "NVLS", "COLLNET_DIRECT", "COLLNET_CHAIN"):
+        if f"_{algo}_" in n or n.endswith(f"_{algo}"):
+            return algo
+    return ""
+
+
 KNOWLEDGE: List[RuntimeRule] = [
-    # ── AllReduce ──
+    # ── AllReduce via dist.barrier() ──
+    # NCCL has NO barrier collective; dist.barrier() reuses the AllReduce
+    # machinery on a cached 1-element barrierTensor_. Only the top two layers
+    # differ from dist.all_reduce(); Layer 4+ (ncclAllReduce …) is identical.
+    # Must come BEFORE the generic AllReduce rule (aten_glob is more specific).
+    RuntimeRule(
+        kernel_glob="ncclDevKernel_AllReduce_*",
+        aten_glob="c10d::barrier*",
+        category="NCCL/AllReduce",
+        layers=[
+            RuntimeLayer("torch.distributed.barrier()", notes="Python c10d entry (distributed_c10d.py:4122)"),
+            RuntimeLayer("ProcessGroupNCCL::barrier()", notes="reuses AllReduce on cached 1-elem barrierTensor_ (header:610/358)"),
+            RuntimeLayer("ProcessGroupNCCL::allreduce_impl() → collective()", notes="fn lambda wraps ncclAllReduce"),
+            RuntimeLayer("ncclAllReduce()  [NCCL C API]", symbol="ncclAllReduce",
+                         notes="builds ncclInfo{ncclFuncAllReduce} on barrierTensor_"),
+            *_nccl_common_tail("AllReduce", "RunWork<AllReduce,…>::run() → run{Algo}<Proto>"),
+        ],
+    ),
+    # ── AllReduce via dist.all_reduce() ──
     RuntimeRule(
         kernel_glob="ncclDevKernel_AllReduce_*",
         category="NCCL/AllReduce",
@@ -75,7 +103,7 @@ KNOWLEDGE: List[RuntimeRule] = [
             RuntimeLayer("ProcessGroupNCCL::collective()", notes="getNCCLComm; syncStream; Work obj; calls fn lambda"),
             RuntimeLayer("ncclAllReduce()  [NCCL C API]", symbol="ncclAllReduce",
                          notes="builds ncclInfo{ncclFuncAllReduce}"),
-            *_nccl_common_tail("AllReduce", "RunWork<AllReduce,…>::run() → runRing<ProtoLL/LL128/Simple>"),
+            *_nccl_common_tail("AllReduce", "RunWork<AllReduce,…>::run() → run{Algo}<Proto>"),
         ],
     ),
     # ── AllGather ──
@@ -205,11 +233,19 @@ KNOWLEDGE: List[RuntimeRule] = [
 ]
 
 
-def _matches(rule: RuntimeRule, kernel_name: str, aten_name: str) -> bool:
+def _matches(rule: RuntimeRule, kernel_name: str, aten_name: str,
+             aten_chain_names: list = None) -> bool:
     if rule.kernel_glob and not _any_match(rule.kernel_glob, kernel_name):
         return False
-    if rule.aten_glob and not _any_match(rule.aten_glob, aten_name):
-        return False
+    if rule.aten_glob:
+        # A rule with an aten_glob matches if ANY aten op in the launch chain
+        # matches (not just the innermost) — e.g. c10d::barrier is an outer
+        # op; record_param_comms may be the innermost.
+        names = [aten_name]
+        if aten_chain_names:
+            names = list(aten_chain_names) + [aten_name]
+        if not any(_any_match(rule.aten_glob, n) for n in names if n):
+            return False
     return True
 
 
@@ -226,19 +262,30 @@ def lookup(kernel_profiler_name: str,
     aten_chain: list of cpu_op dicts (innermost last) that launched the kernel.
     python_chain: list of python_function dicts (unused for matching, reserved).
     """
-    aten_name = aten_chain[-1]["name"] if aten_chain else ""
+    aten_chain_names = [e.get("name", "") for e in aten_chain] if aten_chain else []
+    aten_name = aten_chain_names[-1] if aten_chain_names else ""
     kernel_name = kernel_profiler_name or ""
 
     for rule in KNOWLEDGE:
-        if _matches(rule, kernel_name, aten_name):
+        if _matches(rule, kernel_name, aten_name, aten_chain_names):
             cat = rule.category
             # refine NCCL category via symbol_utils if the glob was generic
             if not cat.startswith("NCCL") and is_nccl_kernel(kernel_name):
                 cat = classify_kernel(kernel_name) or "NCCL"
-            return [
+            frames = [
                 Frame(LAYER_RUNTIME, layer.name,
                       detail={"symbol": layer.symbol} if layer.symbol else {},
                       source="static")
                 for layer in rule.layers
             ]
+            # Specialize the device-dispatch layer for NCCL kernels: the algo
+            # is encoded in the kernel name (_RING / _TREE), so replace the
+            # 'run{Algo}' placeholder with the concrete runRing/runTree.
+            algo = _algo_from_kernel(kernel_name)
+            if algo and cat.startswith("NCCL"):
+                run_fn = {"RING": "runRing", "TREE": "runTree"}.get(algo, f"run{algo}")
+                for f in frames:
+                    if "run{Algo}" in f.name:
+                        f.name = f.name.replace("run{Algo}", run_fn)
+            return frames
     return []
