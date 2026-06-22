@@ -12,6 +12,9 @@ Usage:
     # Dual-GPU with call chain tracing
     python run.py dual --dump-ptx --nccl-only --trace-calls
 
+    # Include synchronization collectives (e.g. barrier) in used-only dump
+    python run.py dual --dump-ptx --nccl-only --include-sync-kernels
+
     # Custom model path
     python run.py single --model-path /path/to/model --dump-ptx
 """
@@ -31,6 +34,8 @@ Examples:
   python run.py single --dump-ptx              # Single GPU, dump all PTX
   python run.py dual --dump-ptx                # Dual GPU, dump all PTX
   python run.py dual --dump-ptx --nccl-only    # Dual GPU, NCCL kernels only
+  python run.py dual --dump-ptx --nccl-only --include-sync-kernels
+                                               # Include barrier/sync kernels
   python run.py dual --dump-ptx --trace-calls  # Dual GPU, dump + trace calls
         """,
     )
@@ -70,6 +75,8 @@ Examples:
     add_common_args(dual_p)
     dual_p.add_argument("--nccl-only", action="store_true",
                         help="Only dump NCCL-related PTX kernels")
+    dual_p.add_argument("--include-sync-kernels", action="store_true",
+                        help="Include synchronization collectives (e.g. barrier) in used-only dump")
     if dual_p.get_default("prompt") is None:
         dual_p.set_defaults(prompt="请用一句话解释什么是分布式训练：")
         dual_p.set_defaults(max_new_tokens=128)
@@ -124,6 +131,8 @@ Examples:
             cmd.append("--all-kernels")
         if args.nccl_only:
             cmd.append("--nccl-only")
+        if args.include_sync_kernels:
+            cmd.append("--include-sync-kernels")
         if args.trace_calls:
             cmd.append("--trace-calls")
         if args.output_dir:

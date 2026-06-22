@@ -48,9 +48,16 @@ ATen 与 kernel 之间的 C++ runtime（`ProcessGroupNCCL::allreduce` →
 `RuntimeRule` 表编码这些层（NCCL 路径源自 `docs/allreduce-deep-dive.md` 的
 9 层全链路）。
 
-### warmup 隔离
+### warmup / sync 隔离
 `FullTracer.trace()` 是一个子 context manager：warmup 放在它**外面**，profiler
-只覆盖真实推理 run，避免 warmup kernel 污染链路。
+只覆盖真实推理 run，避免 warmup kernel 污染链路。双卡模式默认也把
+`dist.barrier()` 这类同步 collective 放在 trace 外面：barrier 仍用于 rank
+同步，但不计入 used-only dump，因此默认输出代表模型 `generate()` 内部真实用到
+的 NCCL kernel。
+
+如需研究“整个程序运行期间的 NCCL 同步”，可加 `--include-sync-kernels`，此时真实
+推理后的 barrier 也纳入 profiler/used-only 集合，通常会额外保留一个 count=1
+的 NCCL AllReduce kernel。
 
 ## 影响
 - 每个 per-kernel `.ptx` 文件头部嵌入其调用链块；`CALL_CHAINS.txt` /

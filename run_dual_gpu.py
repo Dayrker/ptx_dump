@@ -30,6 +30,8 @@ def parse_args():
                    help="Dump all kernels in lib (default: only dump actually-used ones)")
     p.add_argument("--nccl-only", action="store_true",
                    help="Filter PTX to NCCL kernels only")
+    p.add_argument("--include-sync-kernels", action="store_true",
+                   help="Include synchronization collectives (e.g. barrier) in used-only dump")
     p.add_argument("--trace-calls", action="store_true",
                    help="Record call chains (torch → ATen → NCCL)")
     p.add_argument("--output-dir", default=None,
@@ -191,8 +193,12 @@ def run_dual_gpu(args):
                         max_new_tokens=args.max_new_tokens,
                         do_sample=False,
                     )
-                dist.barrier()
                 torch.cuda.synchronize()
+                if args.include_sync_kernels:
+                    dist.barrier()
+                    torch.cuda.synchronize()
+            if not args.include_sync_kernels:
+                dist.barrier()
     else:
         # Warmup
         with torch.no_grad():
@@ -251,7 +257,8 @@ def run_dual_gpu(args):
 
         if use_tracer:
             title = (f"Dual-GPU NCCL Call Chains (torch→ATen→runtime→kernel→PTX,"
-                     f" nccl_only={args.nccl_only})")
+                     f" nccl_only={args.nccl_only},"
+                     f" include_sync_kernels={args.include_sync_kernels})")
             report = tracer.write_report(output_dir, chains=chains,
                                          nccl_only=args.nccl_only, title=title)
             print(f"      Call chain report: {report}")

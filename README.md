@@ -25,6 +25,9 @@ python run.py single --dump-ptx
 # 双卡推理 + dump NCCL PTX（只保留 NCCL 相关）+ 调用链路
 python run.py dual --dump-ptx --nccl-only
 
+# 如果也想把同步 collective（例如 dist.barrier）纳入 used-only dump
+python run.py dual --dump-ptx --nccl-only --include-sync-kernels
+
 # 双卡 dump 全部 PTX（含非 NCCL kernel）
 python run.py dual --dump-ptx
 ```
@@ -45,6 +48,10 @@ Options:
   --dump-ptx          开启 PTX dump
   --dump-sass         额外 dump SASS（GPU 机器码），与 PTX 并行输出
   --nccl-only         (dual only) 只保留 NCCL 相关 kernel
+  --include-sync-kernels
+                      (dual only) used-only 模式也保留同步 collective
+                      （如 dist.barrier）触发的 NCCL kernel
+  --all-kernels       dump 库中所有 kernel（默认只保留运行时实际用到的 kernel）
   --trace-calls       记录 torch → ATen → CUDA 调用链
   --model-path PATH   模型路径 (默认 /home/model/Qwen3-8B)
   --prompt TEXT       自定义输入 prompt
@@ -139,6 +146,10 @@ NCCL 的链路覆盖 `docs/allreduce-deep-dive.md` 的全部 9 层：
 
 ### 注意事项
 
+- 默认 used-only 只统计真实推理 `model.generate()` 内部触发的 kernel；同步用的
+  `dist.barrier()` 仍会执行，但不进入 profiler/dump。加 `--include-sync-kernels`
+  可把这些同步 collective 也纳入输出，常见表现是额外出现一个很小的
+  `ncclDevKernel_AllReduce_Sum_f32_*`。
 - cuBLAS 的 kernel 运行期名称（`ampere_*gemm*`）与 PTX `.entry` 符号
   （mangled，如 `cgemm_largek<...>`）**不是 1:1 对应**，因此 cuBLAS 链路按
   *族*（gemm/elementwise/reduce…）匹配 PTX，而非逐 kernel 精确匹配。

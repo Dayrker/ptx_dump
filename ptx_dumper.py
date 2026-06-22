@@ -344,6 +344,7 @@ class PTXDumper:
                     kernel's .ptx file.
         """
         os.makedirs(output_dir, exist_ok=True)
+        self._clean_previous_outputs(output_dir, prefix)
         written = []
 
         # 1. Write PTX if available
@@ -401,6 +402,21 @@ class PTXDumper:
             print(f"  [WARN] No PTX or SASS collected.")
 
         return written
+
+    def _clean_previous_outputs(self, output_dir: str, prefix: str):
+        """Remove stale files from previous dumps with the same prefix."""
+        patterns = [
+            f"{prefix}_*.ptx",
+            f"{prefix}_all.ptx",
+            f"{prefix}_sass_*.sass",
+            f"{prefix}_all_sass.txt",
+        ]
+        for pattern in patterns:
+            for path in glob.glob(os.path.join(output_dir, pattern)):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     def _annotate_chain_ptx_files(self, chains: list, output_dir: str, prefix: str):
         """Set chain.ptx_file to the actual per-kernel filename written."""
@@ -481,20 +497,37 @@ def _kernel_name_matches(demangled: str, mangled: str, used_kernels: set) -> boo
     Handles both exact demangled match and substring matching
     (profiler names may be truncated or formatted differently).
     """
+    def func_token(name: str) -> str:
+        name = name or ""
+        for sep in ("(", "<"):
+            idx = name.find(sep)
+            if idx > 0:
+                name = name[:idx]
+        return name.strip()
+
+    ptx_is_nccl = is_nccl_kernel(demangled) or is_nccl_kernel(mangled)
+    any_used_nccl = any(is_nccl_kernel(uk or "") for uk in used_kernels)
+
     # Exact match on demangled name
     if demangled in used_kernels:
         return True
 
     # Match by function name prefix (before first parenthesis)
-    func_name = demangled.split("(")[0].strip() if demangled else ""
+    func_name = func_token(demangled)
     for uk in used_kernels:
-        uk_func = uk.split("(")[0].strip() if uk else ""
+        uk_func = func_token(uk)
         if func_name and uk_func and func_name == uk_func:
             return True
 
     # Mangled name fallback (profiler sometimes shows mangled names)
     if mangled in used_kernels:
         return True
+
+    # NCCL kernel names encode the exact collective/reduction dtype/algo/proto:
+    # ncclDevKernel_AllReduce_Sum_f16_RING_LL.  Do not use broad family
+    # matching for NCCL, or one f16 AllReduce launch keeps every reduce dtype.
+    if ptx_is_nccl or any_used_nccl:
+        return False
 
     # Family-keyword fallback: cuBLAS/cuDNN name kernels with descriptive
     # runtime names (ampere_*gemm*) that don't map 1:1 to mangled PTX entries.
