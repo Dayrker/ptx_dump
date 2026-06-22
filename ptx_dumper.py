@@ -19,7 +19,7 @@ import subprocess
 from typing import Optional
 
 from env_setup import EnvConfig
-from symbol_utils import is_nccl_kernel, demangle_symbol
+from symbol_utils import is_nccl_kernel, demangle_symbol, extract_kernel_metadata
 from ptx_formatter import format_ptx_section, write_formatted_ptx
 
 
@@ -221,6 +221,39 @@ class PTXDumper:
         """Extract SASS from local NCCL lib."""
         return self.dump_sass_from_lib(self.config.nccl_lib, arch=arch, label="nccl")
 
+    def dump_lib_ptx(self, lib_path: str, label: str) -> str:
+        """Extract PTX from an arbitrary CUDA .so (cuBLAS/cuDNN/…).
+
+        Wrapper around dump_ptx_from_lib that is tolerant of libs with no
+        embedded PTX (returns "" silently)."""
+        if not lib_path or not os.path.isfile(lib_path):
+            return ""
+        return self.dump_ptx_from_lib(lib_path, label)
+
+    def dump_triton_cache_ptx(self, cache_dir: str) -> str:
+        """Collect PTX from torch's Triton/inductor cache (.ptx files)."""
+        if not cache_dir or not os.path.isdir(cache_dir):
+            return ""
+        chunks = []
+        n = 0
+        for fpath in glob.glob(os.path.join(cache_dir, "**", "*.ptx"), recursive=True):
+            try:
+                with open(fpath) as f:
+                    ptx = f.read()
+            except OSError:
+                continue
+            if ptx and ".version" in ptx:
+                # Tag each block with its triton source file so chains can
+                # reference it; wrap as a synthetic .entry-like block.
+                base = os.path.basename(fpath)
+                self.collected_ptx[f"triton:{base}"] = ptx
+                self._tag_kernels_ptx(ptx, f"triton:{base}")
+                chunks.append(ptx)
+                n += 1
+        if n:
+            print(f"  [OK] Triton cache PTX: {n} file(s) from {cache_dir}")
+        return "\n\n".join(chunks)
+
     def dump_existing_nccl_ptx(self) -> str:
         """Use an existing PTX dump file if available."""
         # Check common locations
@@ -299,12 +332,16 @@ class PTXDumper:
 
     def write_output(self, output_dir: str, nccl_only: bool = False,
                      prefix: str = "dump", arch: str = "sm_80",
-                     used_kernels: set = None) -> list:
+                     used_kernels: set = None, chains: list = None) -> list:
         """Write all collected PTX/SASS to formatted output files.
 
         Args:
             used_kernels: If provided, only write kernels whose demangled name
                           appears in this set. None = write all.
+            chains: optional list of CallChain; each chain is matched to a PTX
+                    .entry (mutated in place: kernel_mangled_name/ptx_file/
+                    matched set), and the chain block is prepended to that
+                    kernel's .ptx file.
         """
         os.makedirs(output_dir, exist_ok=True)
         written = []
@@ -318,10 +355,33 @@ class PTXDumper:
                 all_ptx, kept, total = self._filter_used_ptx(all_ptx, used_kernels)
                 print(f"  [INFO] used-only 过滤: 保留 {kept}/{total} 个 kernel")
             if all_ptx.strip():
-                files = write_formatted_ptx(all_ptx, output_dir, prefix=prefix,
-                                           split_per_kernel=True)
+                # Match profiler chains → PTX .entry names, then build the
+                # {mangled_name: CallChain} map the formatter expects.
+                chains_by_mangled = {}
+                if chains:
+                    ptx_entries = extract_kernel_metadata(all_ptx)
+                    for chain in chains:
+                        if match_chain_to_ptx(chain, ptx_entries):
+                            chains_by_mangled[chain.kernel_mangled_name] = chain
+                    print(f"  [INFO] call chains: matched {len(chains_by_mangled)}"
+                          f"/{len(chains)} kernel(s) to PTX")
+                files = write_formatted_ptx(
+                    all_ptx, output_dir, prefix=prefix,
+                    split_per_kernel=True, chains=chains_by_mangled or None)
                 written.extend(files)
                 print(f"  [OK] PTX written ({len(files)} files)")
+
+                # Record the actual per-kernel filename on each matched chain
+                # so the CALL_CHAINS report can point at it.
+                if chains:
+                    self._annotate_chain_ptx_files(chains, output_dir, prefix)
+            else:
+                # PTX filtered to empty (e.g. nccl-only with no NCCL kernels)
+                if chains:
+                    for chain in chains:
+                        chain.matched = False
+                        if not chain.match_note:
+                            chain.match_note = "no PTX kept after nccl-only / used filter"
 
         # 2. Write SASS if available
         all_sass = "\n\n".join(self.collected_sass.values())
@@ -341,6 +401,29 @@ class PTXDumper:
             print(f"  [WARN] No PTX or SASS collected.")
 
         return written
+
+    def _annotate_chain_ptx_files(self, chains: list, output_dir: str, prefix: str):
+        """Set chain.ptx_file to the actual per-kernel filename written."""
+        import glob
+        names = {}
+        for fp in glob.glob(os.path.join(output_dir, f"{prefix}_*.ptx")):
+            base = os.path.basename(fp)
+            names[base] = fp
+        # Build a quick lookup of mangled -> filename via the metadata in each file
+        # (the formatter writes "  Mangled: <name>" in the header).
+        mang_to_file = {}
+        for base, fp in names.items():
+            try:
+                with open(fp) as f:
+                    head = f.read(4096)
+            except OSError:
+                continue
+            m = re.search(r"^\s*Mangled:\s*(\S+)", head, re.MULTILINE)
+            if m:
+                mang_to_file[m.group(1)] = base
+        for chain in chains:
+            if chain.matched and chain.kernel_mangled_name:
+                chain.ptx_file = mang_to_file.get(chain.kernel_mangled_name)
 
     def _filter_used_ptx(self, ptx_text: str, used_kernels: set) -> tuple:
         """Filter PTX to only kernels whose demangled name is in used_kernels.
@@ -413,6 +496,100 @@ def _kernel_name_matches(demangled: str, mangled: str, used_kernels: set) -> boo
     if mangled in used_kernels:
         return True
 
+    # Family-keyword fallback: cuBLAS/cuDNN name kernels with descriptive
+    # runtime names (ampere_*gemm*) that don't map 1:1 to mangled PTX entries.
+    # Keep a PTX entry if both it and some used kernel share a family keyword.
+    FAMILY = ("gemm", "elementwise", "reduce", "softmax", "attention",
+              "conv", "splitk", "embedding", "layernorm", "rmsnorm")
+    ptx_low = (demangled + " " + mangled).lower()
+    ptx_fam = [kw for kw in FAMILY if kw in ptx_low]
+    if ptx_fam:
+        for uk in used_kernels:
+            uk_low = uk.lower()
+            for kw in ptx_fam:
+                if kw in uk_low:
+                    return True
+
+    return False
+
+
+def match_chain_to_ptx(chain, ptx_entries: list) -> bool:
+    """Set chain.kernel_mangled_name / matched / match_note by matching the
+    chain's profiler kernel name against the PTX .entry names we dumped.
+
+    ptx_entries: list of dicts with 'mangled_name' / 'demangled_name' keys
+                 (as produced by symbol_utils.extract_kernel_metadata).
+
+    Profiler kernel names are usually the demangled C++ signature (often the
+    short form, e.g. 'ampere_sgemm_32x128_tn' or
+    'ncclDevKernel_AllReduce_Sum_f16_RING_LL'); PTX .entry names are mangled.
+    We compare on the function-name token, ignoring template/param suffixes.
+    """
+    from symbol_utils import demangle_symbol, is_nccl_kernel
+    prof_name = (chain.kernel_profiler_name or "").strip()
+
+    # The "func token" = the part before the first '(' or '<' (templates/params).
+    def _func_token(name: str) -> str:
+        name = name or ""
+        for sep in ("(", "<"):
+            idx = name.find(sep)
+            if idx > 0:
+                name = name[:idx]
+        return name.strip()
+
+    prof_token = _func_token(prof_name)
+    prof_is_nccl = is_nccl_kernel(prof_name)
+
+    # Family keywords: cuBLAS/cuDNN/ATen name kernels with descriptive runtime
+    # names (ampere_*gemm*, *elementwise*, *reduce*) that don't map 1:1 to PTX
+    # .entry symbols. We fall back to matching a PTX entry whose name contains
+    # the same family keyword — this tags the GEMM chain to GEMM-family PTX.
+    FAMILY_KEYWORDS = ["gemm", "elementwise", "reduce", "softmax", "attention",
+                       "conv", "splitK", "embedding", "layernorm", "rmsnorm"]
+
+    def _family_keyword(name: str) -> str:
+        low = (name or "").lower()
+        for kw in FAMILY_KEYWORDS:
+            if kw in low:
+                return kw
+        return ""
+
+    prof_family = _family_keyword(prof_name)
+
+    best = None
+    family_best = None
+    for entry in ptx_entries:
+        mangled = entry.get("mangled_name", "")
+        demangled = entry.get("demangled_name") or demangle_symbol(mangled)
+
+        # exact demangled match
+        if prof_name and prof_name == demangled:
+            best = (mangled, "exact demangled match")
+            break
+        # NCCL token match (ignore trailing template/param suffix on both sides)
+        if prof_is_nccl and is_nccl_kernel(mangled):
+            pt_token = _func_token(demangled) or _func_token(mangled)
+            if prof_token and pt_token and prof_token == pt_token:
+                best = (mangled, "nccl token match")
+                break
+        # generic func-token match (cuBLAS short names etc.)
+        pt_token = _func_token(demangled)
+        if prof_token and pt_token and prof_token == pt_token:
+            best = (mangled, "func-token match")
+            # don't break — a more specific NCCL match above is preferred
+        # family-keyword fallback (first such entry is recorded as a fallback)
+        if prof_family and not family_best:
+            if prof_family in (demangled + " " + mangled).lower():
+                family_best = (mangled, f"family match ({prof_family})")
+
+    best = best or family_best
+    if best:
+        chain.kernel_mangled_name = best[0]
+        chain.matched = True
+        chain.match_note = best[1]
+        return True
+    chain.matched = False
+    chain.match_note = "no PTX .entry matched (profiler name not in dumped libs)"
     return False
 
 
@@ -421,58 +598,65 @@ def _kernel_name_matches(demangled: str, mangled: str, used_kernels: set) -> boo
 
 def dump_single_gpu_ptx(config: EnvConfig, trace_calls: bool = False,
                         dump_sass: bool = False,
-                        used_kernels: set = None) -> list:
+                        used_kernels: set = None,
+                        chains: list = None) -> list:
     """
     Dump PTX for single-GPU mode.
 
-    提取策略（按优先级）:
-      1. JIT PTX → 2. NCCL lib PTX → 3. 已有 PTX 文件 → 4. SASS（仅当无 PTX 时兜底）
+    Single-GPU Qwen3-8B inference uses cuBLAS GEMMs, cuDNN attention and
+    ATen/Triton fused kernels — NOT NCCL. So we extract PTX from the libs
+    that actually contain those kernels:
 
-    当 dump_sass=True 时，无论 PTX 是否存在都会额外提取 SASS。
+      1. Triton/inductor cache (.ptx files) — torch's fused elementwise /
+         reduction kernels (the at::native::* chains). Direct .ptx, high value.
+      2. cuBLAS lib  — GEMM PTX (embedded). cuBLAS names kernels with a
+         runtime descriptor (ampere_*gemm*) that does not map 1:1 to PTX
+         .entry symbols, so GEMM kernels are dumped by family, not per-name.
+      3. NCCL lib    — in case any collective ran (usually none on 1 GPU).
+      4. SASS        — only as a fallback when no PTX is found at all.
     """
     dumper = PTXDumper(config)
     has_ptx = False
 
-    # 1. JIT cache
-    jit_dir = os.path.join(config.project_dir, ".jit_cache")
-    jit_ptx = dumper.dump_ptx_from_jit_cache(jit_dir)
-    if jit_ptx:
-        print(f"  [OK] JIT PTX extracted ({len(jit_ptx)} chars)")
-        has_ptx = True
+    # 1. Triton / torch inductor cache
+    if config.torchinductor_cache:
+        tri = dumper.dump_triton_cache_ptx(config.torchinductor_cache)
+        if tri:
+            has_ptx = True
     else:
-        print(f"  [INFO] No JIT PTX (kernels are pre-compiled)")
+        print(f"  [INFO] No torch inductor cache found (set TORCHINDUCTOR_CACHE_DIR?)")
 
-    # 2. NCCL lib PTX
+    # 2. cuBLAS
+    if config.cublas_lib:
+        cb = dumper.dump_lib_ptx(config.cublas_lib, "cublas")
+        if cb:
+            print(f"  [OK] cuBLAS PTX extracted ({len(cb)} chars)")
+            has_ptx = True
+        else:
+            print(f"  [INFO] cuBLAS has no embedded PTX (SASS only)")
+
+    # 3. NCCL (usually unused on a single GPU, but cheap to check)
     nccl_ptx = dumper.dump_nccl_ptx()
     if nccl_ptx:
         print(f"  [OK] NCCL PTX extracted ({len(nccl_ptx)} chars)")
         has_ptx = True
 
-    # 3. Existing PTX dump
-    if not has_ptx:
-        existing = dumper.dump_existing_nccl_ptx()
-        if existing:
-            has_ptx = True
-
-    # 4. SASS — 仅在无 PTX 或用户明确要求时提取
+    # 4. SASS fallback only if nothing found
     if not has_ptx:
         print(f"  [WARN] 未找到任何 PTX 来源，回退到 SASS 提取...")
-        print(f"  [TIP]  重新编译 NCCL 以嵌入 PTX:")
-        print(f"         cd ~/PTX/nccl && make -j src.build NVCC_GENCODE=\"-gencode=arch=compute_80,code=compute_80\"")
         sass = dumper.dump_nccl_sass()
         if sass:
-            print(f"  [OK] NCCL SASS extracted ({len(sass)} chars, "
-                  f"{sass.count('Function')} functions)")
+            print(f"  [OK] NCCL SASS extracted ({len(sass)} chars)")
     elif dump_sass:
         print(f"  [INFO] Extracting SASS (--dump-sass)...")
         sass = dumper.dump_nccl_sass()
         if sass:
-            print(f"  [OK] NCCL SASS extracted ({len(sass)} chars, "
-                  f"{sass.count('Function')} functions)")
+            print(f"  [OK] NCCL SASS extracted ({len(sass)} chars)")
 
     # Write output
     files = dumper.write_output(config.single_ptx_dir, nccl_only=False,
-                                prefix="single", used_kernels=used_kernels)
+                                prefix="single", used_kernels=used_kernels,
+                                chains=chains)
     print(f"  [OK] Wrote {len(files)} files to {config.single_ptx_dir}")
     return files
 
@@ -480,7 +664,8 @@ def dump_single_gpu_ptx(config: EnvConfig, trace_calls: bool = False,
 def dump_dual_gpu_ptx(config: EnvConfig, nccl_only: bool = False,
                       trace_calls: bool = False,
                       dump_sass: bool = False,
-                      used_kernels: set = None) -> list:
+                      used_kernels: set = None,
+                      chains: list = None) -> list:
     """
     Dump PTX for dual-GPU mode (NCCL-focused).
 
@@ -529,6 +714,7 @@ def dump_dual_gpu_ptx(config: EnvConfig, nccl_only: bool = False,
 
     # Write output
     files = dumper.write_output(config.nccl_ptx_dir, nccl_only=nccl_only,
-                                prefix="nccl", used_kernels=used_kernels)
+                                prefix="nccl", used_kernels=used_kernels,
+                                chains=chains)
     print(f"  [OK] Wrote {len(files)} files to {config.nccl_ptx_dir}")
     return files

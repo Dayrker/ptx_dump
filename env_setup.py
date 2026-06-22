@@ -28,7 +28,14 @@ class EnvConfig:
     nccl_include_dir: str = "/home/zhangchen/PTX/nccl/build/include"
     nccl_lib: str = "/home/zhangchen/PTX/nccl/build/lib/libnccl.so.2.21.5"
 
-    # Conda
+    # Other CUDA libs whose kernels run during inference (single-GPU mode).
+    # cuBLAS ships PTX embedded in its .so; the others may be SASS-only.
+    cublas_lib: str = ""
+    cudnn_lib: str = ""
+    cufft_lib: str = ""
+    curand_lib: str = ""
+    # torch's Triton/inductor JIT cache (fused elementwise/reduction kernels)
+    torchinductor_cache: str = ""
     conda_env: str = "torch251"
 
     # Model
@@ -50,6 +57,40 @@ class EnvConfig:
             self.single_ptx_dir = os.path.join(self.project_dir, "single_ptx")
         if not self.nccl_ptx_dir:
             self.nccl_ptx_dir = os.path.join(self.project_dir, "nccl_ptx")
+        # Auto-detect torch's bundled CUDA libs + Triton cache (single-GPU mode
+        # dumps PTX from these, since single-GPU inference uses cuBLAS/cuDNN/ATen
+        # kernels, NOT NCCL).
+        self._autodetect_cuda_libs()
+
+    def _autodetect_cuda_libs(self):
+        """Find cuBLAS/cuDNN/cuFFT/cuRAND and the Triton inductor cache."""
+        try:
+            import torch as _t
+            torch_dir = os.path.dirname(_t.__file__)
+            site = os.path.dirname(torch_dir)
+        except Exception:
+            return
+        nv = os.path.join(site, "nvidia")
+        candidates = {
+            "cublas_lib": (os.path.join(nv, "cublas", "lib"), "libcublas.so"),
+            "cudnn_lib": (os.path.join(nv, "cudnn", "lib"), "libcudnn.so"),
+            "cufft_lib": (os.path.join(nv, "cufft", "lib"), "libcufft.so"),
+            "curand_lib": (os.path.join(nv, "curand", "lib"), "libcurand.so"),
+        }
+        for attr, (d, prefix) in candidates.items():
+            if getattr(self, attr):
+                continue
+            if os.path.isdir(d):
+                for f in sorted(os.listdir(d)):
+                    if f.startswith(prefix):
+                        setattr(self, attr, os.path.join(d, f))
+                        break
+        # Triton/inductor cache (runtime JIT .ptx for fused kernels)
+        if not self.torchinductor_cache:
+            import glob as _g
+            for cand in _g.glob("/tmp/torchinductor_*"):
+                self.torchinductor_cache = cand
+                break
 
     def validate(self) -> list:
         """Validate environment. Returns list of error messages."""
@@ -80,10 +121,28 @@ class EnvConfig:
         return errors
 
     def setup_env(self):
-        """Set environment variables for NCCL + CUDA."""
-        # Prepend local NCCL to LD_LIBRARY_PATH
+        """Set environment variables for NCCL + CUDA.
+
+        torch's libtorch_cuda.so carries a DT_RPATH that points at the pip
+        nvidia-nccl, and DT_RPATH takes precedence over LD_LIBRARY_PATH — so
+        setting LD_LIBRARY_PATH alone is NOT enough to make torch load the
+        locally-built NCCL. We use LD_PRELOAD to force it. This requires the
+        local NCCL to be loadable (it links libcudadevrt; see build_nccl.sh)."""
+        nccl_so = os.path.join(self.nccl_lib_dir, "libnccl.so.2")
+
+        # Prepend local NCCL to LD_LIBRARY_PATH (covers cuobjdump / other tools)
         ld_path = os.environ.get("LD_LIBRARY_PATH", "")
         os.environ["LD_LIBRARY_PATH"] = f"{self.nccl_lib_dir}:{ld_path}" if ld_path else self.nccl_lib_dir
+
+        # Force torch to load the LOCAL NCCL at runtime (beats DT_RPATH).
+        # Only set if the local .so is actually loadable; otherwise leave it to
+        # the pip NCCL so the process still runs.
+        if os.path.exists(nccl_so):
+            existing = os.environ.get("LD_PRELOAD", "")
+            if nccl_so not in existing:
+                os.environ["LD_PRELOAD"] = (
+                    f"{nccl_so}:{existing}" if existing else nccl_so
+                )
 
         # CUDA paths
         os.environ["CUDA_HOME"] = self.cuda_home

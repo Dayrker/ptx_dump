@@ -140,14 +140,23 @@ Examples:
         ld_path = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = f"{nccl_lib}:{ld_path}" if ld_path else nccl_lib
 
+        # Force torch to load the LOCAL NCCL (beats its DT_RPATH → pip nccl).
+        # Requires the local build to be loadable (build_nccl.sh links libcudadevrt).
+        nccl_so = f"{nccl_lib}/libnccl.so.2"
+        if os.path.exists(nccl_so):
+            existing = env.get("LD_PRELOAD", "")
+            env["LD_PRELOAD"] = f"{nccl_so}:{existing}" if existing else nccl_so
+
         print(f"  Launching torchrun with CUDA_VISIBLE_DEVICES={gpus}")
         print(f"  NCCL lib: {nccl_lib}")
+        print(f"  LD_PRELOAD: {env.get('LD_PRELOAD', '(none)')}")
         print()
 
         result = subprocess.run(cmd, env=env)
         sys.exit(result.returncode)
 
-    # Execute
+    # Execute (single-GPU path: run_single_gpu.py calls env_setup.setup_env()
+    # itself, which sets LD_PRELOAD, so the child inherits it)
     result = subprocess.run(cmd)
     sys.exit(result.returncode)
 

@@ -19,15 +19,18 @@
 conda activate torch251
 cd ~/PTX/nccl_ptx_dump
 
-# 单卡推理 + dump 所有 PTX
+# 单卡推理 + dump 所有用到的 PTX（cuBLAS/Triton/NCCL）+ 调用链路
 python run.py single --dump-ptx
 
-# 双卡推理 + dump NCCL PTX (只保留 NCCL 相关函数)
+# 双卡推理 + dump NCCL PTX（只保留 NCCL 相关）+ 调用链路
 python run.py dual --dump-ptx --nccl-only
 
-# 双卡推理 + dump + 调用链路追踪
-python run.py dual --dump-ptx --nccl-only --trace-calls
+# 双卡 dump 全部 PTX（含非 NCCL kernel）
+python run.py dual --dump-ptx
 ```
+
+> 本地 NCCL 在运行时通过 `LD_PRELOAD` 强制加载（见下「NCCL 本地编译」），
+> 因此 dump 出的 PTX 与实际执行的 kernel 一致。
 
 ## CLI 参考
 
@@ -76,13 +79,16 @@ nccl_ptx/
 ## 架构
 
 ```
-run.py                   # CLI 入口 (统一参数解析 + 调度)
-├── run_single_gpu.py    # 单卡推理 + tracing
-├── run_dual_gpu.py      # 双卡 TP 推理 + NCCL tracing
-├── env_setup.py         # 环境配置 (路径、env vars)
-├── ptx_dumper.py        # PTX 提取编排 (cuobjdump + JIT)
-├── ptx_formatter.py     # PTX 格式化 (注释、分类、分段)
-├── call_tracer.py       # 调用链路追踪 (TorchDispatchMode + profiler)
+run.py                   # CLI 入口 (统一参数解析 + 调度 + LD_PRELOAD)
+├── run_single_gpu.py    # 单卡推理 + tracing (cuBLAS/Triton/NCCL PTX)
+├── run_dual_gpu.py      # 双卡 TP 推理 + NCCL tracing (torchrun)
+├── env_setup.py         # 环境配置 (路径、env vars、LD_PRELOAD、自动探测 cuBLAS/Triton)
+├── call_tracer.py       # profiler 生命周期 + 调用链报告 (CALL_CHAINS.txt/json)
+├── chain_builder.py     # chrome-trace 重建 torch→aten→runtime→kernel 链路
+├── chain_model.py       # Frame/CallChain 数据模型
+├── runtime_knowledge.py # 静态 runtime 层知识表 (NCCL/cuBLAS/cuDNN/…，数据驱动)
+├── ptx_dumper.py        # PTX 提取编排 (cuobjdump + JIT/Triton + profiler↔PTX 匹配)
+├── ptx_formatter.py     # PTX 格式化 + 调用链块嵌入每个 kernel 文件
 └── symbol_utils.py      # 符号解析 (demangle + kernel 分类)
 ```
 
@@ -94,26 +100,53 @@ run.py                   # CLI 入口 (统一参数解析 + 调度)
 - **分文件输出**: 每个 kernel 单独一个 .ptx 文件
 - **汇总表**: SUMMARY.txt 列出所有 kernel 及其元数据
 
-## 调用链路追踪
+## 调用链路（torch 算子 → ATen → runtime → kernel → PTX）
 
-`--trace-calls` 会记录从 PyTorch 到底层的完整调用链:
+每个 dump 的 PTX kernel 都附带一条**真实的、逐跳写出**的调用链路。
+profiler 事件树在同一时钟上串起四类事件，按 `correlation` + 时间包含关系还原全链路：
 
 ```
-  [1] aten::mm
-      inputs: [[4096, 4096], [4096, 4096]]
-      output: [[4096, 4096]]
-      └─→ CUDA kernels (1):
-           ├─ ampere_sgemm_128x64_tn
-           └─ ...
-
-  [42] aten::all_reduce
-      └─→ NCCL calls (1):
-           ├─ ncclDevKernel_AllReduce_Sum_f16_RING_LL
-      ┌─ PyTorch: dist.all_reduce()
-      ├─ ATen:    c10d::all_reduce / ncclAllReduce
-      ├─ NCCL:    ncclAllReduce() → Ring topology
-      └─ Kernel:  ncclDevKernel_AllReduce_Sum_f16_RING_LL
+[python]  modeling_qwen3.py(81): Qwen3MLP.forward → Linear.forward
+[aten]    aten::linear → aten::matmul → aten::mm   shapes=[[12,12288],[12288,4096]]
+[runtime] at::native::mm → cublasGemmEx() → ampere_*gemm_*    ← 静态知识 (runtime_knowledge.py)
+[launch]  cudaLaunchKernel  corr=26153
+[kernel]  ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_...
+[ptx]     single_001_..._.ptx
 ```
+
+NCCL 的链路覆盖 `docs/allreduce-deep-dive.md` 的全部 9 层：
+
+```
+[python] torch.distributed.all_reduce()
+[aten]   c10d::allreduce_
+[runtime] ProcessGroupNCCL::allreduce → allreduce_impl → collective
+        → ncclAllReduce → ncclEnqueueCheck → taskAppend
+        → scheduleCollTasksToPlan → ncclLaunchKernel
+        → ncclKernelMain → RunWork<AllReduce,…>::run() → runRing<ProtoLL>
+[launch] cudaLaunchKernelExC  corr=54244
+[kernel] ncclDevKernel_AllReduce_Sum_f16_RING_LL
+[ptx]    nccl_003_..._RING_LL_...ptx
+```
+
+- **python / aten / launch / kernel / ptx** 层来自 `torch.profiler` chrome trace
+  （`python_function` / `cpu_op` / `cuda_runtime` / `kernel` 四类事件）。
+- **runtime** 层（ProcessGroupNCCL→ncclAllReduce→…、cublasGemmEx→…）profiler
+  看不到，是 `runtime_knowledge.py` 里的数据驱动静态知识表。
+- 链路写在每个 per-kernel `.ptx` 文件头部，也汇总在 `CALL_CHAINS.txt` /
+  `call_chains.json`。
+- 「一路链接都写上」指的是：从 torch 算子、ATen 算子、底层 runtime、kernel launch、
+  到具体 PTX 文件，每一跳都有对应行。
+
+### 注意事项
+
+- cuBLAS 的 kernel 运行期名称（`ampere_*gemm*`）与 PTX `.entry` 符号
+  （mangled，如 `cgemm_largek<...>`）**不是 1:1 对应**，因此 cuBLAS 链路按
+  *族*（gemm/elementwise/reduce…）匹配 PTX，而非逐 kernel 精确匹配。
+- ATen 原生 fused kernel（`elementwise_kernel` 等）的 PTX 不在 cuBLAS/cuDNN/NCCL
+  内（cuDNN、libtorch_cuda 为 SASS-only），可能在 Triton inductor 缓存里；
+  找不到时该链路仍写出（无 `.ptx` 链接，注明 unmatched）。
+- 双卡模式下 `run_dual_gpu.py` 只在 rank 0 追踪；NCCL kernel 符号跨 rank 一致，
+  故 rank 0 的链路足以对应 dump 出的 PTX。
 
 ## 文件说明
 
@@ -130,9 +163,24 @@ run.py                   # CLI 入口 (统一参数解析 + 调度)
 | `CONTEXT.md` | 共享领域术语 (Agent-friendly) |
 | `docs/adr/` | 架构决策记录 |
 
-## NCCL 本地编译
+## NCCL 本地编译（且让 torch 真正加载它）
 
-本项目使用本地编译的 NCCL 2.21.5 (`/home/zhangchen/PTX/nccl/`)。
+本项目使用本地编译的 NCCL 2.21.5（`/home/zhangchen/PTX/nccl/`），用 `~/PTX/build_nccl.sh`
+一键重建。两个要点：
+
+1. **PTX 嵌入**：`NVCC_GENCODE="-gencode=arch=compute_80,code=compute_80"`
+   （`compute_80` = PTX，非 `sm_80` = SASS），这样 `cuobjdump -ptx` 能提出 PTX。
+2. **可加载**：NCCL device code 用 `-rdc` 编译，`nvcc -dlink` 产生的 `device_glue.o`
+   会引用 `__fatbinwrap_..._cuda_device_runtime_...`，该符号由 `libcudadevrt.a` 提供。
+   上游 `make src.build` 的 host link 没链 `-lcudadevrt`，导致 `.so` 无法被 `dlopen`
+   （torch 加载即崩）。`build_nccl.sh` 给 `src/Makefile` 的 `LDFLAGS` 补上 `-lcudadevrt`。
+
+### 让 torch 真正用本地 NCCL
+
+torch 的 `libtorch_cuda.so` 带 `DT_RPATH` 指向 pip 装的 `nvidia-nccl-cu12`，且
+`DT_RPATH` **优先于** `LD_LIBRARY_PATH`——光设 `LD_LIBRARY_PATH` 不够。
+本项目在 `env_setup.py` / `run.py` 里设 `LD_PRELOAD` 指向本地 `libnccl.so.2`，
+`LD_PRELOAD` 优先于 `DT_RPATH`。`/proc/<pid>/maps` 可验证加载的是本地版。
 
 ### PTX 与 SASS 的区别
 
@@ -141,18 +189,15 @@ run.py                   # CLI 入口 (统一参数解析 + 调度)
 | 本质 | 虚拟 GPU 汇编（中间表示） | 实际 GPU 机器码 |
 | 可读性 | 高（虚拟寄存器、文本指令） | 低（二进制编码、固定寄存器） |
 | 编译选项 | `code=compute_80` | `code=sm_80` |
-| 默认包含 | ❌ NCCL 默认不嵌入 | ✅ 始终包含 |
+| 本地 NCCL | ✅ 已嵌入（112 个 `.entry`） | ✅ 始终包含 |
 
-`--dump-ptx` 优先提取 PTX。如果 NCCL 没有嵌入 PTX（默认情况），系统会提示你重新编译。
-如需同时输出 SASS，加 `--dump-sass`。
+`--dump-ptx` 优先提取 PTX。如需同时输出 SASS，加 `--dump-sass`。
 
-### 重新编译 NCCL（嵌入 PTX）
+### 重新编译 NCCL
 ```bash
-cd ~/PTX/nccl
-make -j src.build NVCC_GENCODE="-gencode=arch=compute_80,code=compute_80"
+bash ~/PTX/build_nccl.sh
+# 重建会校验 __fatbinwrap 已定义、.so 可加载
 ```
-
-> 关键: `code=compute_80` (PTX) 而非 `code=sm_80` (SASS)。
 
 ## 相关文档
 

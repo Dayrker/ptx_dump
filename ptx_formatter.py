@@ -8,8 +8,22 @@ with demangled names, section headers, and instruction comments.
 
 import re
 import os
-from typing import Optional
+from typing import Optional, Dict, List
 from symbol_utils import demangle_symbol, classify_kernel, format_kernel_header, extract_kernel_metadata
+
+# Avoid a hard import cycle: chain_model is imported lazily where needed.
+def _chain_header_for(mangled_name: str, chains) -> str:
+    """Return the chain block text for a kernel, or '' if none attached."""
+    if not chains:
+        return ""
+    try:
+        from chain_model import format_chain_header
+    except Exception:
+        return ""
+    chain = chains.get(mangled_name)
+    if chain is None:
+        return ""
+    return format_chain_header(chain)
 
 
 # PTX instruction categories for annotation
@@ -81,13 +95,15 @@ def annotate_instruction(line: str) -> Optional[str]:
     return None
 
 
-def format_ptx_section(ptx_text: str, max_lines_per_kernel: int = 0) -> str:
+def format_ptx_section(ptx_text: str, max_lines_per_kernel: int = 0,
+                       chains: Dict[str, object] = None) -> str:
     """
     Format PTX text with annotations and section headers.
 
     Args:
         ptx_text: Raw PTX from cuobjdump
         max_lines_per_kernel: 0 = full, >0 = truncate to N lines
+        chains: optional {mangled_entry_name: CallChain} to prepend per kernel
     """
     kernels = extract_kernel_metadata(ptx_text)
     if not kernels:
@@ -119,6 +135,12 @@ def format_ptx_section(ptx_text: str, max_lines_per_kernel: int = 0) -> str:
     for i, (meta, block) in enumerate(zip(kernels, kernel_blocks)):
         output.append(format_kernel_header(meta))
         output.append("")
+
+        # Prepend the call chain block, if attached.
+        chain_hdr = _chain_header_for(meta["mangled_name"], chains)
+        if chain_hdr:
+            output.append(chain_hdr.rstrip("\n"))
+            output.append("")
 
         lines = block.split("\n")
         if max_lines_per_kernel > 0 and len(lines) > max_lines_per_kernel:
@@ -193,7 +215,8 @@ def _format_raw_ptx(ptx_text: str) -> str:
 
 def write_formatted_ptx(ptx_text: str, output_dir: str, prefix: str = "dump",
                         split_per_kernel: bool = True,
-                        max_lines_per_kernel: int = 0) -> list:
+                        max_lines_per_kernel: int = 0,
+                        chains: Dict[str, object] = None) -> list:
     """
     Write formatted PTX to files.
 
@@ -203,6 +226,8 @@ def write_formatted_ptx(ptx_text: str, output_dir: str, prefix: str = "dump",
         prefix: Filename prefix
         split_per_kernel: If True, write one file per kernel
         max_lines_per_kernel: 0 = full
+        chains: optional {mangled_entry_name: CallChain}; if present, each
+                per-kernel file is prepended with its call chain block.
 
     Returns:
         List of written file paths
@@ -222,6 +247,10 @@ def write_formatted_ptx(ptx_text: str, output_dir: str, prefix: str = "dump",
             filepath = os.path.join(output_dir, filename)
 
             formatted = format_kernel_header(meta) + "\n\n"
+            # Prepend the call chain block for this kernel, if attached.
+            chain_hdr = _chain_header_for(meta["mangled_name"], chains)
+            if chain_hdr:
+                formatted += chain_hdr
             for line in block.split("\n"):
                 annotation = annotate_instruction(line)
                 if annotation:
@@ -236,7 +265,7 @@ def write_formatted_ptx(ptx_text: str, output_dir: str, prefix: str = "dump",
             written.append(filepath)
 
     # Always write combined file
-    combined = format_ptx_section(ptx_text, max_lines_per_kernel)
+    combined = format_ptx_section(ptx_text, max_lines_per_kernel, chains=chains)
     combined_path = os.path.join(output_dir, f"{prefix}_all.ptx")
     with open(combined_path, "w") as f:
         f.write(combined)

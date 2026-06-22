@@ -1,31 +1,60 @@
-# ADR-003: 基于 TorchDispatchMode 的调用链追踪
+# ADR-003: 调用链路追踪（torch 算子 → ATen → runtime → kernel → PTX）
 
 ## 状态
-已采纳（2026-06-17）
+已更新（2026-06-21，重构为真实的 per-kernel 链路）
 
 ## 背景
-我们需要追踪从 `torch.op()` → ATen 调度 → CUDA kernel → PTX 函数的完整路径。PyTorch 自带的 profiler 能提供 kernel 名称，但无法展示调度链路。
+我们需要为每个 dump 的 PTX kernel 附带一条**真实**的调用链路：从 torch 算子，
+经 ATen 调度，到底层 runtime、kernel launch、PTX 文件，每一跳都写出来
+（「一路链接都写上」）。
+
+旧实现（`TorchDispatchMode` + `prof.key_averages()`）只能产出 ATen op 频率表
+和 CUDA kernel 时间表，NCCL 链路甚至是硬编码字符串模板——不是真实链路。
 
 ## 决策
-使用 `TorchDispatchMode`（Python 层的 ATen 调度钩子）配合 `torch.profiler`（CUDA 事件捕获）来实现。
+以 `torch.profiler` 的 **chrome trace** 为唯一真源重建链路。
 
-### 工作原理
-1. `TorchDispatchMode.__torch_dispatch__` 拦截每一个 ATen 操作调用
-2. 记录：操作名称、输入 shape、输出 shape、时间戳、嵌套深度
-3. `torch.profiler` 通过 `key_averages()` 捕获 CUDA kernel 事件（含时间统计）
-4. 后处理阶段：通过 profiler 自身的分组机制关联 ATen 操作和 CUDA kernel
-5. 构建调用树：`torch.matmul` → `aten::mm` → `ampere_sgemm_128x64_tn`
+### 工作原理（torch 2.5.1 已验证）
+`profile(activities=[CPU,CUDA], record_shapes=True, with_stack=True)` 退出后，
+`prof.export_chrome_trace(path)` 产出 JSON，含四类事件、共用一个绝对 µs 时钟：
 
-### 为什么不用 `torch.fx`？
-`torch.fx` 追踪的是静态计算图 — 无法捕获动态调度和 NCCL 通信调用。`TorchDispatchMode` 能在运行时看到每一个操作，包括分布式操作。
+| cat | 含义 | 关键字段 |
+|-----|------|---------|
+| `python_function` | torch 算子（Python 帧） | name = `file.py(lineno): func` |
+| `cpu_op` | ATen op | `args.Input Dims`（shapes） |
+| `cuda_runtime` | `cudaLaunchKernel`/`cudaLaunchKernelExC` | `args.correlation` |
+| `kernel` | device kernel | `args.correlation` + grid/block/smem |
 
-### 为什么不用 `CUDA_LAUNCH_BLOCKING=1` + 堆栈追踪？
-将所有 kernel 串行化执行会严重改变时序，且无法捕获异步的 NCCL 操作。我们的方案开销较低（约 10-20%），且保留了真实的执行语义。
+链路按 `correlation` + 时间包含关系还原：
 
-### 为什么用 `key_averages()` 做关联？
-`prof.key_averages()` 按操作名称分组，已经内置了 CPU 操作和 CUDA kernel 的时间关联。相比手动按时间窗口匹配（时钟源不一致会导致错误），这种方式更可靠。
+```
+kernel.correlation  ──match──▶ cuda_runtime (same correlation)
+cuda_runtime.ts      ─contains──▶ cpu_op[ts, ts+dur]   (ATen op(s))
+innermost cpu_op.ts  ─contains──▶ enclosing python_function 帧
+```
+
+见 `chain_builder.py`。
+
+### 为什么不用 `FunctionEvent.stack` / `_get_kineto_results`
+torch 2.5.1 中 `FunctionEvent.stack` **恒为空**（即使 `with_stack=True`）；
+`prof._get_kineto_results()` / `experimental_event_tree()` 在此版本**不存在**。
+chrome trace 的 `python_function` 事件才是 Python 层的可靠来源。
+
+### 为什么 runtime 层用静态知识表
+profiler 只能看到 torch 算子、ATen op、`cudaLaunchKernel`、device kernel。
+ATen 与 kernel 之间的 C++ runtime（`ProcessGroupNCCL::allreduce` →
+`ncclAllReduce` → `ncclEnqueueCheck` → … ；`cublasGemmEx` → …）无法观测，
+但每个 kernel 族是确定性的。`runtime_knowledge.py` 用数据驱动的
+`RuntimeRule` 表编码这些层（NCCL 路径源自 `docs/allreduce-deep-dive.md` 的
+9 层全链路）。
+
+### warmup 隔离
+`FullTracer.trace()` 是一个子 context manager：warmup 放在它**外面**，profiler
+只覆盖真实推理 run，避免 warmup kernel 污染链路。
 
 ## 影响
-- 追踪开销约 10-20%（对于分析场景可接受）
-- 嵌套深度追踪支持调用树重建
-- NCCL 调用通过 `dist.all_reduce` 在调度日志中可见
+- 每个 per-kernel `.ptx` 文件头部嵌入其调用链块；`CALL_CHAINS.txt` /
+  `call_chains.json` 汇总。
+- cuBLAS profiler 名称（`ampere_*gemm*`）与 PTX `.entry` mangled 符号不是 1:1，
+  按 *族*（gemm/elementwise/reduce…）匹配，见 `ptx_dumper.match_chain_to_ptx`。
+- 双卡仅 rank 0 追踪；NCCL kernel 符号跨 rank 一致，PTX 来自本地 `libnccl.so`。

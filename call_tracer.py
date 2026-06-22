@@ -1,391 +1,178 @@
 #!/usr/bin/env python3
 """
-call_tracer.py — Trace call chains from torch ops → ATen → CUDA kernels → PTX.
+call_tracer.py — Build per-kernel call chains for the dumped PTX.
 
-Uses:
-  - TorchDispatchMode to intercept ATen operator calls
-  - torch.profiler to capture CUDA kernel events
-  - Post-hoc correlation to build the full chain tree
+This module owns the profiler lifecycle and the report writing. The actual
+chain reconstruction (profiler chrome trace → torch op → ATen → runtime → kernel)
+lives in chain_builder.py; the static runtime layers live in
+runtime_knowledge.py; the data model lives in chain_model.py.
 
-Output: structured call chain tree showing how each torch op
-        reaches its underlying CUDA kernel / NCCL function.
+Key correctness point: profiling is scoped to the REAL inference run only —
+warmup runs outside the profile so warmup kernels don't pollute the chains.
+
+Flow (in the run scripts):
+
+    with full_trace_context() as tracer:
+        # warmup — NOT traced
+        _ = model.generate(..., max_new_tokens=5)
+        torch.cuda.synchronize()
+        # trace ONLY the real run
+        with tracer.trace():
+            output_ids = model.generate(..., max_new_tokens=N)
+        torch.cuda.synchronize()
+
+    chains = tracer.build_chains(nccl_only=args.nccl_only)
+    dump_*_ptx(config, ..., chains=chains, used_kernels=...)   # matches chains → PTX
+    tracer.write_report(output_dir, chains=chains, nccl_only=...)  # CALL_CHAINS + json
 """
+
+from __future__ import annotations
 
 import os
 import json
-import time
-from collections import defaultdict
 from contextlib import contextmanager
+from typing import List, Optional
 
-import torch
-from torch.utils._python_dispatch import TorchDispatchMode
 from torch.profiler import profile, ProfilerActivity
 
+from chain_model import CallChain, chain_to_jsonable
+from chain_builder import build_chains_from_prof
+from symbol_utils import is_nccl_kernel
 
-# ─── ATen dispatch tracer ────────────────────────────────────────────
 
-
-class ATenCallTracer(TorchDispatchMode):
-    """
-    Intercepts every ATen op via __torch_dispatch__.
-
-    Records:
-      - op name (e.g., aten::mm, aten::addmm)
-      - input/output shapes
-      - timestamp
-      - nesting depth (for tree reconstruction)
-    """
+class FullTracer:
+    """Owns a torch.profiler profile scoped to the real run, plus chain output."""
 
     def __init__(self):
-        self.log = []
-        self._depth = 0
-        self._stack = []
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-
-        entry = {
-            "op": str(func),
-            "op_name": func.name() if hasattr(func, "name") else str(func),
-            "timestamp": time.perf_counter(),
-            "depth": self._depth,
-            "input_shapes": _extract_shapes(args),
-            "output_shapes": None,
-            "children": [],
-        }
-
-        parent = self._stack[-1] if self._stack else None
-        self._stack.append(entry)
-        self._depth += 1
-
-        try:
-            result = func(*args, **kwargs)
-        finally:
-            self._depth -= 1
-            self._stack.pop()
-
-        entry["output_shapes"] = _extract_shapes(result)
-
-        if parent:
-            parent["children"].append(entry)
-        else:
-            self.log.append(entry)
-
-        return result
-
-
-def _extract_shapes(obj) -> list:
-    """Extract tensor shapes from args/result."""
-    if isinstance(obj, torch.Tensor):
-        return [list(obj.shape)]
-    elif isinstance(obj, (list, tuple)):
-        shapes = []
-        for x in obj:
-            if isinstance(x, torch.Tensor):
-                shapes.append(list(x.shape))
-        return shapes if shapes else None
-    return None
-
-
-# ─── Profiler-based kernel tracer ─────────────────────────────────────
-
-
-class KernelTracer:
-    """
-    Uses torch.profiler to capture CUDA kernel launches
-    and correlate them with CPU-side ATen ops via key_averages.
-    """
-
-    def __init__(self):
-        self.key_averages = []  # grouped by op name
-        self.cuda_kernels = []  # kernel-only events
-        self._profiler = None
+        self._prof: Optional[profile] = None
+        self._chains: List[CallChain] = []
+        self._tracing = False
 
     @contextmanager
-    def trace(self, activities=None):
-        """Context manager for profiling."""
-        if activities is None:
-            activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+    def trace(self):
+        """Context manager that profiles ONLY the code inside it.
 
-        with profile(
-            activities=activities,
+        Put the warmup OUTSIDE this block so warmup kernels are excluded from
+        the chains."""
+        self._prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
-            with_stack=False,
-        ) as prof:
-            self._profiler = prof
-            yield prof
-
-        self._parse_events(prof)
-
-    def _parse_events(self, prof):
-        """Parse profiler events using key_averages for proper grouping."""
-        # key_averages: groups events by (op name, input shapes)
-        for evt in prof.key_averages():
-            cuda_time = getattr(evt, "device_time_total", 0)
-            record = {
-                "name": evt.key,
-                "cpu_time_us": evt.cpu_time_total,
-                "cuda_time_us": cuda_time,
-                "count": evt.count,
-                "is_cuda_kernel": not evt.key.startswith("aten::") and cuda_time > 0,
-                "is_aten_op": evt.key.startswith("aten::"),
-                "input_shapes": getattr(evt, "input_shapes", None),
-            }
-            self.key_averages.append(record)
-
-            # Separate CUDA kernels
-            if record["is_cuda_kernel"]:
-                self.cuda_kernels.append(record)
-
-
-# ─── Call chain builder ───────────────────────────────────────────────
-
-
-class CallChainBuilder:
-    """
-    Combines ATen dispatch trace + profiler key_averages
-    to build the full call chain: torch.op → ATen → CUDA kernel → PTX.
-    """
-
-    def __init__(self):
-        self.chains = []
-        self.kernel_summary = []
-
-    def build_from_traces(self, aten_log: list, key_averages: list,
-                          cuda_kernels: list) -> dict:
-        """
-        Build call chains.
-
-        Returns dict with:
-          - aten_ops: list of ATen op records with frequency
-          - kernel_summary: top CUDA kernels by time
-          - op_kernel_map: mapping from ATen ops to their kernels
-        """
-        # ATen ops from dispatch trace
-        op_counts = defaultdict(int)
-        op_shapes = defaultdict(list)
-        flat = []
-        self._flatten_aten(aten_log, flat)
-        for entry in flat:
-            name = entry["op_name"]
-            op_counts[name] += 1
-            if entry.get("input_shapes"):
-                op_shapes[name].append(entry["input_shapes"])
-
-        aten_ops = [
-            {"name": name, "count": count, "sample_shapes": op_shapes[name][:3]}
-            for name, count in sorted(op_counts.items(), key=lambda x: -x[1])
-        ]
-
-        # CUDA kernel summary from profiler
-        kernel_summary = sorted(
-            [k for k in key_averages if k.get("is_cuda_kernel")],
-            key=lambda x: -x["cuda_time_us"],
+            with_stack=True,            # needed for python_function events
         )
+        self._prof.__enter__()
+        self._tracing = True
+        try:
+            yield self._prof
+        finally:
+            self._prof.__exit__(None, None, None)
+            self._tracing = False
 
-        # ATen ops from profiler (with CUDA time — these launched kernels)
-        aten_with_cuda = [
-            k for k in key_averages
-            if k.get("is_aten_op") and k["cuda_time_us"] > 0
+    def build_chains(self, nccl_only: bool = False) -> List[CallChain]:
+        """Reconstruct one CallChain per unique kernel from the profile."""
+        if self._prof is None:
+            return []
+        self._chains = build_chains_from_prof(self._prof, nccl_only=nccl_only)
+        return self._chains
+
+    def get_used_kernel_names(self) -> set:
+        """Kernel names that actually ran (for used-only PTX filtering)."""
+        if not self._chains and self._prof is not None:
+            self.build_chains()
+        return {c.kernel_profiler_name for c in self._chains}
+
+    def write_report(self, output_dir: str, chains: Optional[List[CallChain]] = None,
+                     nccl_only: bool = False,
+                     title: str = "Call Chains") -> str:
+        """Write CALL_CHAINS.txt (human-readable) + call_chains.json."""
+        if chains is None:
+            chains = self._chains
+        os.makedirs(output_dir, exist_ok=True)
+
+        report_path = os.path.join(output_dir, "CALL_CHAINS.txt")
+        with open(report_path, "w") as f:
+            f.write(self._render_report(chains, title=title, nccl_only=nccl_only))
+
+        # JSON — keyed by mangled name (or profiler name if unmatched)
+        json_path = os.path.join(output_dir, "call_chains.json")
+        serial = {}
+        for c in chains:
+            key = c.kernel_mangled_name or c.kernel_profiler_name
+            serial[key] = chain_to_jsonable(c)
+        with open(json_path, "w") as f:
+            json.dump(serial, f, indent=2, default=str)
+
+        return report_path
+
+    # ── internal ──
+
+    def _render_report(self, chains: List[CallChain], title: str,
+                       nccl_only: bool) -> str:
+        lines = [
+            "=" * 78,
+            f"  {title}",
+            "=" * 78,
+            "",
+            f"  Unique kernels traced : {len(chains)}",
+            f"  NCCL-only filter      : {nccl_only}",
+            f"  Profiler              : torch.profiler chrome trace "
+            f"(python_function → cpu_op → cuda_runtime → kernel, joined by correlation)",
+            f"  Runtime layers        : static knowledge (runtime_knowledge.py)",
+            "",
         ]
 
-        self.chains = aten_ops
-        self.kernel_summary = kernel_summary
+        matched = [c for c in chains if c.matched]
+        unmatched = [c for c in chains if not c.matched]
 
-        return {
-            "aten_ops": aten_ops,
-            "kernel_summary": kernel_summary,
-            "aten_with_cuda": aten_with_cuda,
-        }
-
-    def _flatten_aten(self, log: list, flat: list):
-        """Flatten nested ATen log into a time-ordered list."""
-        for entry in log:
-            flat.append(entry)
-            if entry.get("children"):
-                self._flatten_aten(entry["children"], flat)
-
-
-# ─── Call chain formatter ─────────────────────────────────────────────
-
-
-def format_call_chain(result: dict, output_path: str, title: str = "Call Chains"):
-    """Write call chains to a human-readable file."""
-    aten_ops = result.get("aten_ops", [])
-    kernel_summary = result.get("kernel_summary", [])
-    aten_with_cuda = result.get("aten_with_cuda", [])
-
-    lines = [
-        "=" * 72,
-        f"  {title}",
-        "=" * 72,
-        "",
-    ]
-
-    # ─── Section 1: ATen Operation Frequency ───
-    lines.append("━" * 72)
-    lines.append("  1. ATen Operations (from TorchDispatchMode)")
-    lines.append(f"     Total unique ops: {len(aten_ops)}")
-    lines.append(f"     Total op calls: {sum(o['count'] for o in aten_ops)}")
-    lines.append("━" * 72)
-    lines.append("")
-
-    lines.append(f"  {'Count':>6s}  {'Operation':<45s}  Sample Shape")
-    lines.append(f"  {'─' * 6}  {'─' * 45}  {'─' * 25}")
-    for op in aten_ops:
-        shape_str = ""
-        if op["sample_shapes"]:
-            shape_str = str(op["sample_shapes"][0])
-        lines.append(f"  {op['count']:>6d}  {op['name']:<45s}  {shape_str}")
-    lines.append("")
-
-    # ─── Section 2: CUDA Kernel Summary ───
-    lines.append("━" * 72)
-    lines.append("  2. CUDA Kernels (from torch.profiler)")
-    lines.append(f"     Total unique kernels: {len(kernel_summary)}")
-    lines.append("━" * 72)
-    lines.append("")
-
-    if kernel_summary:
-        lines.append(f"  {'CUDA Time':>10s}  {'Count':>6s}  {'Kernel':<50s}")
-        lines.append(f"  {'─' * 10}  {'─' * 6}  {'─' * 50}")
-        for k in kernel_summary[:50]:
-            time_str = f"{k['cuda_time_us'] / 1000:.1f}ms"
-            lines.append(f"  {time_str:>10s}  {k['count']:>6d}  {k['name'][:50]}")
-        if len(kernel_summary) > 50:
-            lines.append(f"  ... +{len(kernel_summary) - 50} more kernels")
-    else:
-        lines.append("  (no CUDA kernels captured)")
-    lines.append("")
-
-    # ─── Section 3: ATen → CUDA mapping ───
-    lines.append("━" * 72)
-    lines.append("  3. ATen → CUDA Mapping (ops that launched kernels)")
-    lines.append("━" * 72)
-    lines.append("")
-
-    if aten_with_cuda:
-        for op in sorted(aten_with_cuda, key=lambda x: -x["cuda_time_us"])[:30]:
-            time_str = f"{op['cuda_time_us'] / 1000:.1f}ms"
-            lines.append(f"  {op['name']}  ({op['count']}×, CUDA: {time_str})")
-            if op.get("input_shapes"):
-                lines.append(f"    shapes: {op['input_shapes']}")
+        if nccl_only and not any(is_nccl_kernel(c.kernel_profiler_name) for c in chains):
+            lines.append("  ! No NCCL kernels observed in this run.")
+            lines.append("    (possible causes: tiny tensors took the single-rank memcpy")
+            lines.append("     fast path, or NCCL was not initialized.)")
             lines.append("")
 
-    # ─── Section 4: NCCL Communication ───
-    nccl_kernels = [k for k in kernel_summary if "nccl" in k["name"].lower()]
-    if nccl_kernels:
-        lines.append("━" * 72)
-        lines.append("  4. NCCL Communication Kernels")
-        lines.append("━" * 72)
-        lines.append("")
+        # NCCL kernels first, then the rest
+        nccl_chains = [c for c in matched if c.category.startswith("NCCL")]
+        other_chains = [c for c in matched if not c.category.startswith("NCCL")]
 
-        for k in nccl_kernels:
-            time_str = f"{k['cuda_time_us'] / 1000:.1f}ms"
-            lines.append(f"  {k['name']}")
-            lines.append(f"    CUDA time: {time_str} | count: {k['count']}")
-            lines.append(f"    Call chain:")
-            lines.append(f"      torch.distributed.all_reduce()")
-            lines.append(f"        → ProcessGroupNCCL::allreduce()")
-            lines.append(f"          → ncclAllReduce()")
-            lines.append(f"            → {k['name']}")
+        if nccl_chains:
+            lines.append("━" * 78)
+            lines.append(f"  NCCL kernels with PTX ({len(nccl_chains)})")
+            lines.append("━" * 78)
+            for c in nccl_chains:
+                lines.append(c.render_block())
+                lines.append("")
+
+        if other_chains:
+            lines.append("━" * 78)
+            lines.append(f"  Other kernels with PTX ({len(other_chains)})")
+            lines.append("━" * 78)
+            for c in other_chains:
+                lines.append(c.render_block())
+                lines.append("")
+
+        if unmatched:
+            lines.append("━" * 78)
+            lines.append(f"  Kernels with NO matched PTX ({len(unmatched)})")
+            lines.append("  (ran during inference but not present in the dumped libs)")
+            lines.append("━" * 78)
+            for c in unmatched[:50]:
+                lines.append(f"  • {c.kernel_profiler_name[:70]}")
+                lines.append(f"      {c.match_note or 'no PTX block matched'}")
+                lines.append(f"      category={c.category}  calls={c.occurrence_count}")
+            if len(unmatched) > 50:
+                lines.append(f"  ... +{len(unmatched) - 50} more")
             lines.append("")
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w") as f:
-        f.write("\n".join(lines))
-
-    return output_path
-
-
-# ─── Convenience: combined tracer ─────────────────────────────────────
+        lines.append("=" * 78)
+        return "\n".join(lines)
 
 
 @contextmanager
 def full_trace_context(trace_aten: bool = True, trace_kernels: bool = True):
-    """
-    Combined context manager for full call chain tracing.
-
-    Usage:
-        with full_trace_context() as tracer:
-            model(inputs)
-        tracer.write_report("output_dir")
-    """
-    tracer = FullTracer(trace_aten=trace_aten, trace_kernels=trace_kernels)
-    tracer.start()
+    """Combined context manager. Profiling is started later via tracer.trace()."""
+    # trace_aten / trace_kernels kept for API compatibility; the chrome trace
+    # captures both unconditionally inside tracer.trace().
+    tracer = FullTracer()
     try:
         yield tracer
     finally:
-        tracer.stop()
-
-
-class FullTracer:
-    """Combined ATen + profiler tracer."""
-
-    def __init__(self, trace_aten: bool = True, trace_kernels: bool = True):
-        self.trace_aten = trace_aten
-        self.trace_kernels = trace_kernels
-
-        self._aten_tracer = ATenCallTracer() if trace_aten else None
-        self._kernel_tracer = KernelTracer() if trace_kernels else None
-        self._chain_builder = CallChainBuilder()
-        self._result = None
-
-    def start(self):
-        if self._aten_tracer:
-            self._aten_tracer.__enter__()
-        if self._kernel_tracer:
-            self._kernel_tracer._ctx = self._kernel_tracer.trace()
-            self._kernel_tracer._ctx.__enter__()
-
-    def stop(self):
-        if self._aten_tracer:
-            self._aten_tracer.__exit__(None, None, None)
-        if self._kernel_tracer and hasattr(self._kernel_tracer, '_ctx'):
-            self._kernel_tracer._ctx.__exit__(None, None, None)
-
-    def build_chains(self) -> dict:
-        """Build call chains from collected traces."""
-        aten_log = self._aten_tracer.log if self._aten_tracer else []
-        key_avgs = self._kernel_tracer.key_averages if self._kernel_tracer else []
-        cuda_kernels = self._kernel_tracer.cuda_kernels if self._kernel_tracer else []
-
-        self._result = self._chain_builder.build_from_traces(
-            aten_log, key_avgs, cuda_kernels
-        )
-        return self._result
-
-    def get_used_kernel_names(self) -> set:
-        """Return set of demangled CUDA kernel names captured by profiler."""
-        if self._result is None:
-            self.build_chains()
-        return {k["name"] for k in self._result.get("kernel_summary", [])}
-
-    def write_report(self, output_dir: str, title: str = "Call Chain Report") -> str:
-        """Write complete call chain report."""
-        if self._result is None:
-            self.build_chains()
-
-        report_path = os.path.join(output_dir, "CALL_CHAINS.txt")
-        format_call_chain(self._result, report_path, title=title)
-
-        # Also write raw JSON
-        json_path = os.path.join(output_dir, "call_chains.json")
-        _write_chain_json(self._result, json_path)
-
-        return report_path
-
-
-def _write_chain_json(result: dict, path: str):
-    """Write chains as JSON."""
-    serializable = {
-        "aten_ops": result.get("aten_ops", [])[:100],
-        "kernel_summary": [
-            {"name": k["name"], "cuda_time_us": k["cuda_time_us"], "count": k["count"]}
-            for k in result.get("kernel_summary", [])[:100]
-        ],
-    }
-
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(serializable, f, indent=2, default=str)
+        pass

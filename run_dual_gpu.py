@@ -169,27 +169,36 @@ def run_dual_gpu(args):
         print(f"[4/5] Running inference...")
 
     use_tracer = (args.trace_calls or args.dump_ptx) and rank == 0
+    chains = None
 
     if use_tracer:
         with full_trace_context(trace_aten=True, trace_kernels=True) as tracer:
-            # Warmup (triggers NCCL kernel compilation)
+            # Warmup (triggers NCCL kernel compilation) — OUTSIDE the profile
             with torch.no_grad():
                 _ = model.generate(**inputs, max_new_tokens=5, do_sample=False)
             dist.barrier()
             torch.cuda.synchronize()
 
             if rank == 0:
-                print(f"      Warmup done. NCCL kernels compiled. Full inference...")
+                print(f"      Warmup done. NCCL kernels compiled. Tracing the real run...")
 
-            # Real inference
-            with torch.no_grad():
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                )
-            dist.barrier()
-            torch.cuda.synchronize()
+            # Profile ONLY the real inference run
+            with tracer.trace():
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=False,
+                    )
+                dist.barrier()
+                torch.cuda.synchronize()
+
+        # Build per-kernel chains (rank 0 only)
+        chains = tracer.build_chains(nccl_only=args.nccl_only)
+        if rank == 0:
+            n_nccl = sum(1 for c in chains if c.category.startswith("NCCL"))
+            print(f"      Tracing complete: {len(chains)} unique kernels chained"
+                  f" ({n_nccl} NCCL)")
     else:
         # Warmup
         with torch.no_grad():
@@ -228,12 +237,15 @@ def run_dual_gpu(args):
         files = dump_dual_gpu_ptx(config, nccl_only=args.nccl_only,
                                    trace_calls=args.trace_calls,
                                    dump_sass=args.dump_sass,
-                                   used_kernels=used_kernels)
+                                   used_kernels=used_kernels,
+                                   chains=chains)
         print(f"      Written {len(files)} files.")
 
         if use_tracer:
-            title = f"Dual-GPU NCCL Call Chains (nccl_only={args.nccl_only})"
-            report = tracer.write_report(output_dir, title=title)
+            title = (f"Dual-GPU NCCL Call Chains (torch→ATen→runtime→kernel→PTX,"
+                     f" nccl_only={args.nccl_only})")
+            report = tracer.write_report(output_dir, chains=chains,
+                                         nccl_only=args.nccl_only, title=title)
             print(f"      Call chain report: {report}")
     elif rank == 0:
         print(f"\n[5/5] Skipping PTX dump (use --dump-ptx to enable)")

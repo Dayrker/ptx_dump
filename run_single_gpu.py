@@ -89,24 +89,29 @@ def run_single_gpu(args):
     # ─── Inference (with optional tracing) ───
     print(f"[3/4] Running inference...")
     use_tracer = args.trace_calls or args.dump_ptx
+    chains = None
 
     if use_tracer:
         with full_trace_context(trace_aten=True, trace_kernels=True) as tracer:
-            # Warmup
+            # Warmup — OUTSIDE the profile, so warmup kernels don't pollute chains
             with torch.no_grad():
                 _ = model.generate(**inputs, max_new_tokens=5, do_sample=False)
             torch.cuda.synchronize()
+            print(f"      Warmup done. Tracing the real run...")
 
-            # Real inference
-            with torch.no_grad():
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                )
-            torch.cuda.synchronize()
+            # Profile ONLY the real inference run
+            with tracer.trace():
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=False,
+                    )
+                torch.cuda.synchronize()
 
-        print(f"      Tracing complete.")
+        # Build per-kernel chains from the profile
+        chains = tracer.build_chains(nccl_only=False)
+        print(f"      Tracing complete: {len(chains)} unique kernels chained")
     else:
         with torch.no_grad():
             # Warmup
@@ -138,14 +143,16 @@ def run_single_gpu(args):
             print(f"      used-only 模式: 只保留运行时实际触发的 kernel")
         files = dump_single_gpu_ptx(config, trace_calls=args.trace_calls,
                                      dump_sass=args.dump_sass,
-                                     used_kernels=used_kernels)
+                                     used_kernels=used_kernels,
+                                     chains=chains)
         print(f"      Written {len(files)} files.")
     else:
         print(f"\n[4/4] Skipping PTX dump (use --dump-ptx to enable)")
 
     # ─── Call chain report ───
     if use_tracer and (args.trace_calls or args.dump_ptx):
-        report = tracer.write_report(output_dir, title="Single-GPU Call Chains")
+        report = tracer.write_report(output_dir, chains=chains,
+                                     title="Single-GPU Call Chains (torch→ATen→runtime→kernel→PTX)")
         print(f"      Call chain report: {report}")
 
     print(f"\n{'=' * 60}")
