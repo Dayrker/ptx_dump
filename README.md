@@ -226,5 +226,13 @@ bash ~/PTX/build_nccl.sh
 
 ## 相关文档
 
+### PTX 兼容调研（device 函数做 PTX 兼容，配套 host/driver/cpu 函数怎么支持）
+
+- [docs/ptx-compat-onepager.md](docs/ptx-compat-onepager.md) — **一页纸讲解速记**（开会讲用：一句话主线 + 准备流程图 + SW 团队任务清单 + 实测数字 + 常见追问）
+- [docs/allreduce-deep-dive.md](docs/allreduce-deep-dive.md) — 启动一个 NCCL device kernel 需要准备什么（正文聚焦启动准备过程，硬核 9 层细节降级为附录）
+- [docs/ptx-compat-requirements.xlsx](docs/ptx-compat-requirements.xlsx) — 启动 PTX 所需的 CPU/driver/host 支持依赖表（按阶段/团队分，标注必选 + 难度，由 `gen_ptx_compat_xlsx.py` 生成）
+
+### 其它
+
 - [CONTEXT.md](CONTEXT.md) — 共享领域术语
 - [docs/adr/](docs/adr/) — 架构决策记录
