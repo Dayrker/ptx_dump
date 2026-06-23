@@ -16,8 +16,53 @@
 
 ---
 
+## 给 NCCL 小白的速读版
+
+如果你刚开始看 NCCL，可以先把这篇文档理解成一句话：
+
+> PyTorch 只负责把 `tensor/count/dtype/op/stream` 交给 NCCL；NCCL 的 host 代码选择算法并
+> 准备 `ncclWork`；真正跨 GPU 搬数据和做加法的是最后 launch 出来的 device kernel。
+
+最小心智模型是三段：
+
+| 新手问题 | 答案 | 本文对应 |
+|---|---|---|
+| 谁发起通信？ | Python 的 `dist.all_reduce()`，落到 PyTorch C++ 的 `ProcessGroupNCCL`。 | Layer 1-3 |
+| 谁决定怎么通信？ | NCCL host 侧：检查参数、选 `RING+LL`、算 channel/线程、生成 `ncclWork`。 | Layer 4-7 |
+| 谁真的搬数据？ | GPU 上的 `ncclDevKernel_AllReduce_...`，通过 peer GPU 的 ring buffer 做 `send/recv/reduce`。 | Layer 8-9 |
+
+几个先记住的词：
+
+| 词 | 可以先这么理解 |
+|---|---|
+| `rank` | 第几张 GPU。双卡时就是 rank 0 / rank 1。 |
+| `comm` / communicator | 一组 GPU 的通信上下文，里面有 rank 数、channel、拓扑等。 |
+| `channel` | NCCL 把大 tensor 切成多条“通信车道”并行跑；`grid.x` 通常就是活跃 channel 数。 |
+| `algo` | 通信拓扑算法，例如 `RING` / `TREE` / `NVLS`。本次实测选中 `RING`。 |
+| `proto` | 单次传输的协议，例如 `LL` / `LL128` / `SIMPLE`。本次实测选中 `LL`。 |
+| `ncclWork` | host 侧写给 device kernel 的任务单：buffer 地址、count、chunk、funcIndex 都在里面。 |
+| `channelMask` | 哪些 channel 参与本次 kernel 的 64-bit 位图；`grid.x = popcount(channelMask)`。 |
+| `P2P` | 一张 GPU 能直接读写另一张 GPU 暴露出来的 memory，这是 Ring LL 的通信基础。 |
+
+读这篇文档时建议按这个顺序：
+
+1. 先看 [全链路总览](#1-全链路总览)，知道 9 层名字和每层交出的“产物”。
+2. 再看 [算法选择策略](#74-算法选择策略)，理解为什么实测是 `RING+LL`。
+3. 然后看 [ncclLaunchKernel](#8-第七层nccllaunchkernel--真正的-kernel-launch)，抓住 kernel 的 3 个参数、`grid/block/smem`。
+4. 最后看 [RunWork](#10-第九层runwork--allreduce-设备端实现) 和 [PTX 转译要点](#12-ptx-转译要点)，这是迁移/转译最关键的部分。
+
+如果你的目标是做 sunrise/pccl 兼容，先别被所有内部函数吓到。落地时最关键的是四件事：
+
+- 对 PyTorch 暴露兼容的 NCCL 公共 API：至少 `ncclAllReduce`、communicator 初始化、类型/归约枚举。
+- host 侧最终要构造出 device kernel 看得懂的 `ncclDevComm`、`ncclWork`、`channelMask`。
+- runtime 必须能 launch 对应 PTX，并支持动态 shared memory、stream/event、跨卡 P2P 映射。
+- device/ISA 转译必须覆盖 `ld/st.volatile.global`、`bar.sync`、`__popcll` 这些关键指令/语义。
+
+---
+
 ## 目录
 
+0. [给 NCCL 小白的速读版](#给-nccl-小白的速读版)
 1. [全链路总览](#1-全链路总览)
 2. [第一层：PyTorch Python API](#2-第一层pytorch-python-api)
 3. [第二层：ProcessGroupNCCL::allreduce()](#3-第二层processgroupncclallreduce)

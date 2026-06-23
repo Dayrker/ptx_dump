@@ -6,13 +6,43 @@
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from pathlib import Path
 
 wb = Workbook()
 
 # ============================================================
-# Sheet 1: 三层依赖表 (主表)
+# Sheet 0: 新手导图
 # ============================================================
 ws = wb.active
+ws.title = "先读导图"
+ws.append(["主题", "新手版解释", "对应表 / 文档"])
+guide_rows = [
+    ("一句话",
+     "PyTorch 发起 all_reduce；NCCL host 侧选择算法并准备任务单；GPU device kernel 负责跨卡搬数据和归约。",
+     "docs/allreduce-deep-dive.md §给 NCCL 小白的速读版"),
+    ("先看哪张表",
+     "先读本页，再看“三层依赖表”判断要实现哪些 host/runtime 能力；最后看“④device层_ISA要求”和“验证检查清单”。",
+     "本工作簿"),
+    ("三段心智模型",
+     "① ATen/PyTorch 负责入口；② NCCL/pccl 负责 API、调度、构造 ncclWork；③ Runtime 负责 launch 和跨卡内存；④ device PTX 真正执行。",
+     "三层依赖表 / ④device层_ISA要求"),
+    ("barrier 为什么也出现",
+     "NCCL 没有独立 ncclBarrier；PyTorch barrier 用 1 元素 tensor 跑一次 AllReduce，所以会看到 AllReduce kernel。",
+     "allreduce-deep-dive.md §barrier 变体"),
+    ("实测主线",
+     "双卡 Qwen3-8B trace 里，f16 all_reduce 和 f32 barrier 都选中 RING+LL；差异主要是 count/grid/block。",
+     "落地策略与约束 / allreduce-deep-dive.md §7.4"),
+    ("最容易踩坑",
+     "不是所有 NCCL 内部函数都必须照抄，但最终写给 device 的结构体布局、channelMask、P2P ring buffer、smem/block 必须和 PTX 期待一致。",
+     "验证检查清单"),
+]
+for r in guide_rows:
+    ws.append(list(r))
+
+# ============================================================
+# Sheet 1: 三层依赖表 (主表)
+# ============================================================
+ws = wb.create_sheet("三层依赖表")
 ws.title = "三层依赖表"
 
 headers = ["层", "子类", "函数 / 符号", "出处", "作用", "sunrise 侧需提供", "必选/可选"]
@@ -198,6 +228,92 @@ for r in strat_rows:
     ws3.append(list(r))
 
 # ============================================================
+# Sheet 4: 术语表
+# ============================================================
+ws4 = wb.create_sheet("术语表")
+ws4.append(["术语", "一句话理解", "为什么重要"])
+term_rows = [
+    ("AllReduce",
+     "每张 GPU 先各有一份数据；调用后，每张 GPU 都拿到所有 rank 归约后的完整结果。",
+     "训练里常用于梯度求和/平均，是本次 PTX 链路的 collective 类型。"),
+    ("rank",
+     "通信组里的 GPU 编号；双卡时通常是 rank 0 和 rank 1。",
+     "ring/tree 拓扑、prev/next、buffer 地址都按 rank 组织。"),
+    ("communicator / ncclComm",
+     "一组 GPU 的通信上下文，记录 rank 数、拓扑、channel、device 侧结构体地址等。",
+     "PyTorch 每次 all_reduce 最终都要拿到一个 comm 才能调用 ncclAllReduce。"),
+    ("channel",
+     "NCCL 把一次大通信拆成多条并行“车道”。",
+     "实测 f16 all_reduce 用 16 个 channel，所以 grid.x=16；barrier 只用 1 个。"),
+    ("algo",
+     "通信拓扑算法，例如 RING、TREE、NVLS。",
+     "algo 决定 device 端走 runRing 还是 runTree；本次实测选中 RING。"),
+    ("proto",
+     "通信协议，例如 LL、LL128、SIMPLE。",
+     "proto 决定底层搬运方式；本地 used-only PTX 是 LL 特化 kernel。"),
+    ("ncclWork / ncclWorkElem",
+     "host 写给 device kernel 的任务单，里面有 send/recv buffer、count、chunk、funcIndex 等。",
+     "pccl 自研 host 时不必照抄 NCCL 函数名，但必须生成 PTX 能读懂的任务单布局。"),
+    ("channelMask",
+     "64-bit 位图，哪个 bit 为 1 就代表哪个 channel 参与本次 kernel。",
+     "kernel 内部用 __popcll 把 blockIdx.x 映射到真实 channelId。"),
+    ("P2P memory mapping",
+     "一张 GPU 能直接访问另一张 GPU 暴露出来的 ring buffer。",
+     "Ring LL 的 ld/st.volatile.global 依赖这个能力完成跨卡通信。"),
+    ("dynamic shared memory / smem",
+     "launch kernel 时额外申请的 shared memory 字节数。",
+     "实测 RING_LL 也需要约 88416 B；不能简单以为 LL 就是 0。"),
+]
+for r in term_rows:
+    ws4.append(list(r))
+
+# ============================================================
+# Sheet 5: 验证检查清单
+# ============================================================
+ws5 = wb.create_sheet("验证检查清单")
+ws5.append(["优先级", "检查项", "通过标准", "对应依据"])
+check_rows = [
+    ("P0",
+     "NCCL 公共 API 兼容",
+     "能导出并链接 ncclAllReduce、ncclGetUniqueId、ncclCommInitRank/All，以及兼容的 datatype/reduce op 枚举。",
+     "三层依赖表: ② 公共API"),
+    ("P0",
+     "AllReduce 参数语义正确",
+     "count 按元素数而不是字节数解释；sendbuff/recvbuff 支持 in-place；stream 异步语义保持。",
+     "allreduce-deep-dive.md §5"),
+    ("P0",
+     "device 结构体 ABI 兼容",
+     "ncclDevComm、ncclDevChannel、ncclWork、ncclWorkElem 的字段偏移与 PTX 读取一致。",
+     "④device层_ISA要求 / allreduce-deep-dive.md §11-12"),
+    ("P0",
+     "P2P ring buffer 可访问",
+     "peer GPU buffer 能被本 GPU 通过 global memory load/store 访问，volatile 读写语义正确。",
+     "④device层_ISA要求: ld/st.volatile.global"),
+    ("P0",
+     "kernel launch 参数一致",
+     "传入 3 个参数 {devComm, channelMask, workHead}；grid.x=popcount(channelMask)；block/smem 与调度结果一致。",
+     "allreduce-deep-dive.md §8"),
+    ("P1",
+     "RING+LL 路径可跑通",
+     "至少复现实测 f16 all_reduce: grid=16、block=512、smem≈88416；以及 f32 barrier: grid=1、block=96。",
+     "落地策略与约束: 实测依据"),
+    ("P1",
+     "barrier 复用 AllReduce",
+     "torch barrier 最终能走 count=1 的 ncclAllReduce，不需要虚构 ncclBarrier。",
+     "allreduce-deep-dive.md §barrier 变体"),
+    ("P1",
+     "PTX ISA 覆盖",
+     "支持 __popcll、bar.sync 0、bar.sync %r,%n、ld/st.volatile.global 以及 shared/global 地址转换。",
+     "④device层_ISA要求"),
+    ("P2",
+     "Generic kernel 边界清楚",
+     "LL128/SIMPLE 不误用 RING_LL 特化 entry；需要时改走 ncclDevKernel_Generic。",
+     "allreduce-deep-dive.md §12.3 注意事项"),
+]
+for r in check_rows:
+    ws5.append(list(r))
+
+# ============================================================
 # 样式
 # ============================================================
 THIN = Side(style="thin", color="B0B0B0")
@@ -210,9 +326,17 @@ TIER_FILLS = {
     "①": PatternFill("solid", fgColor="DDEBF7"),
     "②": PatternFill("solid", fgColor="FFF2CC"),
     "③": PatternFill("solid", fgColor="FCE4D6"),
+    "④": PatternFill("solid", fgColor="E2F0D9"),
+}
+
+PRIORITY_FILLS = {
+    "P0": PatternFill("solid", fgColor="F4CCCC"),
+    "P1": PatternFill("solid", fgColor="FCE5CD"),
+    "P2": PatternFill("solid", fgColor="D9EAD3"),
 }
 
 def style_sheet(ws, widths):
+    ws.sheet_view.showGridLines = False
     # header
     for cell in ws[1]:
         cell.fill = HEADER_FILL
@@ -230,16 +354,25 @@ def style_sheet(ws, widths):
             if first.startswith(key):
                 row[0].fill = fill
                 break
+        if first in PRIORITY_FILLS:
+            row[0].fill = PRIORITY_FILLS[first]
+            row[0].font = Font(bold=True)
     # column widths
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     # freeze header
     ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for i in range(2, ws.max_row + 1):
+        ws.row_dimensions[i].height = 42
 
+style_sheet(wb["先读导图"], [18, 76, 42])
 style_sheet(ws,  [16, 22, 46, 26, 50, 46, 14])
 style_sheet(ws2, [16, 48, 24, 52])
 style_sheet(ws3, [26, 96])
+style_sheet(ws4, [24, 58, 64])
+style_sheet(ws5, [10, 34, 68, 42])
 
-out = "ptx-compat-requirements.xlsx"
+out = Path(__file__).with_name("ptx-compat-requirements.xlsx")
 wb.save(out)
 print("written:", out)
